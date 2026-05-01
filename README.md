@@ -27,6 +27,8 @@ npx ccxray claude
 
 That's it. Proxy starts, Claude Code launches through it, and the dashboard opens automatically in your browser. Run it in multiple terminals — they automatically share one dashboard.
 
+The launcher argument is provider-backed. Today `claude` is supported; unknown provider commands fail fast instead of silently starting an unconfigured proxy.
+
 ### Other ways to run
 
 ```bash
