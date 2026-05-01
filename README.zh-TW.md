@@ -27,6 +27,8 @@ npx ccxray claude
 
 就這樣。代理啟動、Claude Code 透過代理連線、儀表板自動在瀏覽器中開啟。在多個終端機執行時會自動共用同一個 dashboard。
 
+launcher 參數由 provider registry 管理。目前支援 `claude`；未知的 provider command 會直接失敗，避免靜默啟動未設定的 proxy。
+
 ### 其他執行方式
 
 ```bash
