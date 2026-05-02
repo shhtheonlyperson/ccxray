@@ -198,6 +198,105 @@ function closeConnectSocket(socket, status, message) {
   socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
 }
 
+function sanitizeConnectHeaders(headers) {
+  const clean = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (key.toLowerCase() === 'proxy-authorization') continue;
+    clean[key] = value;
+  }
+  return clean;
+}
+
+function recordConnectTunnelEntry({ clientReq, target, status, statusText, startTime, errorMessage }) {
+  const id = helpers.timestamp();
+  const ts = helpers.taipeiTime();
+  const cwd = hub.lookupClientCwd() || process.cwd();
+  const sessionKey = cwd || 'standard-proxy';
+  const sessionId = `gemini-${crypto.createHash('sha1').update(sessionKey).digest('hex').slice(0, 12)}`;
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  const title = `CONNECT ${target.host}:${target.port}`;
+  const reqLog = {
+    method: 'CONNECT',
+    target: `${target.host}:${target.port}`,
+    headers: sanitizeConnectHeaders(clientReq.headers),
+  };
+  const resLog = {
+    status,
+    statusText,
+    encrypted: true,
+    note: 'TLS payload is tunneled and not captured.',
+    ...(errorMessage ? { error: errorMessage } : {}),
+  };
+  if (!store.sessionMeta[sessionId]) store.sessionMeta[sessionId] = {};
+  store.sessionMeta[sessionId].provider = 'google';
+  store.sessionMeta[sessionId].cwd = cwd || null;
+  store.sessionMeta[sessionId].lastSeenAt = Date.now();
+
+  const entry = {
+    id, ts, sessionId, method: 'CONNECT', url: `${target.host}:${target.port}`,
+    provider: 'google',
+    agent: 'gemini',
+    req: reqLog, res: resLog,
+    elapsed, status, isSSE: false,
+    tokens: null,
+    usage: null, cost: null,
+    responseMetadata: { provider: 'google', tunnel: true, encrypted: true },
+    maxContext: null,
+    cwd: cwd || null,
+    receivedAt: startTime,
+    thinkingDuration: null,
+    duplicateToolCalls: null,
+    model: null,
+    msgCount: 0,
+    toolCount: 0,
+    toolCalls: {},
+    isSubagent: false,
+    sessionInferred: false,
+    title,
+    stopReason: status >= 200 && status < 300 ? 'tunnel_established' : 'tunnel_failed',
+    toolFail: status < 200 || status >= 300,
+    sysHash: null,
+    toolsHash: null,
+    coreHash: null,
+    thinkingStripped: undefined,
+    toolSources: {},
+  };
+
+  const reqWritePromise = config.storage.write(id, '_req.json', JSON.stringify(reqLog))
+    .catch(e => console.error('Write CONNECT req.json failed:', e.message));
+  const resWritePromise = config.storage.write(id, '_res.json', JSON.stringify(resLog))
+    .catch(e => console.error('Write CONNECT res.json failed:', e.message));
+  entry._writePromise = Promise.all([reqWritePromise, resWritePromise]);
+  store.entries.push(entry);
+  store.trimEntries();
+  const { broadcast } = require('./sse-broadcast');
+  broadcast(entry);
+
+  const indexLine = JSON.stringify({
+    id, ts, sessionId,
+    method: entry.method,
+    url: entry.url,
+    provider: entry.provider,
+    agent: entry.agent,
+    model: entry.model, msgCount: entry.msgCount, toolCount: entry.toolCount,
+    toolCalls: entry.toolCalls, isSubagent: entry.isSubagent, sessionInferred: entry.sessionInferred,
+    cwd: entry.cwd, isSSE: false,
+    usage: null, cost: null, maxContext: null,
+    responseMetadata: entry.responseMetadata,
+    stopReason: entry.stopReason, title, thinkingDuration: null,
+    toolFail: entry.toolFail,
+    elapsed, status,
+    receivedAt: startTime,
+    sysHash: null, toolsHash: null,
+    coreHash: null,
+    toolSources: entry.toolSources,
+  });
+  config.storage.appendIndex(indexLine + '\n').catch(e => console.error('Write CONNECT index failed:', e.message));
+  entry.req = null;
+  entry.res = null;
+  entry._loaded = false;
+}
+
 function summarizeText(value, maxLen = 240) {
   if (value == null) return null;
   const text = typeof value === 'string' ? value : JSON.stringify(value);
@@ -763,6 +862,7 @@ const server = http.createServer((clientReq, clientRes) => {
 });
 
 server.on('connect', (clientReq, clientSocket, head) => {
+  const startTime = Date.now();
   if (!isLoopbackRemoteAddress(clientSocket.remoteAddress)) {
     closeConnectSocket(clientSocket, 403, 'Forbidden');
     return;
@@ -778,14 +878,17 @@ server.on('connect', (clientReq, clientSocket, head) => {
   const upstreamSocket = net.connect(target.port, target.host, () => {
     connected = true;
     clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    recordConnectTunnelEntry({ clientReq, target, status: 200, statusText: 'Connection Established', startTime });
     if (head && head.length > 0) upstreamSocket.write(head);
     upstreamSocket.pipe(clientSocket);
     clientSocket.pipe(upstreamSocket);
   });
 
-  upstreamSocket.on('error', () => {
-    if (!connected) closeConnectSocket(clientSocket, 502, 'Bad Gateway');
-    else clientSocket.destroy();
+  upstreamSocket.on('error', (err) => {
+    if (!connected) {
+      recordConnectTunnelEntry({ clientReq, target, status: 502, statusText: 'Bad Gateway', startTime, errorMessage: err.message });
+      closeConnectSocket(clientSocket, 502, 'Bad Gateway');
+    } else clientSocket.destroy();
   });
   clientSocket.on('error', () => upstreamSocket.destroy());
 });

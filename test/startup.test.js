@@ -305,6 +305,20 @@ describe('standard proxy tunnel', () => {
     });
 
     assert.ok(response.includes('echo:ping'));
+
+    const { entries } = await httpGet(proxyPort, '/_api/entries');
+    const tunnelEntry = entries.find(entry => entry.method === 'CONNECT' && entry.url === `127.0.0.1:${targetPort}`);
+    assert.ok(tunnelEntry, 'CONNECT tunnel should be visible in dashboard entries');
+    assert.equal(tunnelEntry.provider, 'google');
+    assert.equal(tunnelEntry.agent, 'gemini');
+    assert.equal(tunnelEntry.title, `CONNECT 127.0.0.1:${targetPort}`);
+    assert.equal(tunnelEntry.stopReason, 'tunnel_established');
+
+    const fullEntry = await httpGet(proxyPort, '/_api/entry/' + encodeURIComponent(tunnelEntry.id));
+    assert.equal(fullEntry.req.method, 'CONNECT');
+    assert.equal(fullEntry.req.target, `127.0.0.1:${targetPort}`);
+    assert.equal(fullEntry.res.encrypted, true);
+    assert.match(fullEntry.res.note, /not captured/);
   });
 
   it('rejects malformed CONNECT targets', async () => {
@@ -824,7 +838,10 @@ describe('P0: proxy end-to-end forwarding', () => {
     assert.ok(resFiles.length > 0, `Expected res log files, found: ${files.join(', ')}`);
 
     // Verify req log content
-    const reqContent = JSON.parse(fs.readFileSync(path.join(logsDir, reqFiles[0]), 'utf8'));
+    const reqContent = reqFiles
+      .map(file => JSON.parse(fs.readFileSync(path.join(logsDir, file), 'utf8')))
+      .find(req => req.model === 'claude-sonnet-4-20250514');
+    assert.ok(reqContent, 'Expected a Claude request log file');
     assert.equal(reqContent.model, 'claude-sonnet-4-20250514');
     assert.ok(reqContent.messages);
   });
