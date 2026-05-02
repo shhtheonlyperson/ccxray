@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const net = require('net');
+const WebSocket = require('ws');
 
 const SERVER_SCRIPT = path.resolve(__dirname, '..', 'server', 'index.js');
 const TEST_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'ccxray-startup-test-'));
@@ -117,6 +118,20 @@ describe('S4: standalone mode', () => {
     assert.ok(html.includes('<!DOCTYPE html') || html.includes('<html'));
   });
 
+  it('injects a configurable dashboard display name', async () => {
+    const brandedPort = await findFreePort();
+    const brandedChild = spawnServer(['--port', String(brandedPort)], {
+      env: { CCXRAY_DISPLAY_NAME: 'customray' },
+    });
+    try {
+      await waitForPort(brandedPort);
+      const html = await httpGetRaw(brandedPort, '/');
+      assert.ok(html.includes('"APP_NAME":"customray"'), html);
+    } finally {
+      await killAndWait(brandedChild);
+    }
+  });
+
   it('serves hub status', async () => {
     const data = await httpGet(port, '/_api/hub/status');
     assert.equal(data.app, 'ccxray');
@@ -219,7 +234,7 @@ describe('provider launcher selection', () => {
 
     assert.equal(code, 1);
     assert.ok(stderr.includes('unsupported provider "unknown-ai"'), stderr);
-    assert.ok(stderr.includes('claude'), stderr);
+    assert.ok(stderr.includes('claude, codex'), stderr);
   });
 });
 
@@ -416,6 +431,146 @@ describe('E2: claude not found', () => {
   });
 });
 
+describe('codex launcher mode', () => {
+  function createFakeCodexCapture() {
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'ccxray-fake-codex-'));
+    const capturePath = path.join(fakeBin, 'capture.json');
+    const codexPath = path.join(fakeBin, 'codex');
+    fs.writeFileSync(codexPath, [
+      '#!/bin/sh',
+      'node -e \'const fs=require("fs"); fs.writeFileSync(process.env.CCXRAY_TEST_CODEX_CAPTURE, JSON.stringify({ argv: process.argv.slice(1), anthropicBaseUrl: process.env.ANTHROPIC_BASE_URL || null }));\' -- "$@"',
+    ].join('\n'));
+    fs.chmodSync(codexPath, 0o755);
+    return { fakeBin, capturePath };
+  }
+
+  it('spawns codex with OpenAI base URL override and forwards user args', async () => {
+    const port = await findFreePort();
+    const { fakeBin, capturePath } = createFakeCodexCapture();
+
+    const nodeBin = path.dirname(process.execPath);
+    const { code, stderr } = await spawnAndCollect(
+      ['--port', String(port), 'codex', 'exec', 'hello', '--flag'],
+      8000,
+      {
+        PATH: `${fakeBin}${path.delimiter}${nodeBin}`,
+        CCXRAY_TEST_CODEX_CAPTURE: capturePath,
+      }
+    );
+
+    assert.equal(code, 0, stderr);
+    const capture = JSON.parse(fs.readFileSync(capturePath, 'utf8'));
+    assert.deepEqual(capture.argv, [
+      '-c',
+      `openai_base_url="http://localhost:${port}/v1"`,
+      'exec',
+      'hello',
+      '--flag',
+    ]);
+    assert.equal(capture.anthropicBaseUrl, null);
+
+    fs.rmSync(fakeBin, { recursive: true, force: true });
+  });
+
+  it('consumes --no-browser as a ccxray flag before launching codex', async () => {
+    const port = await findFreePort();
+    const { fakeBin, capturePath } = createFakeCodexCapture();
+
+    const nodeBin = path.dirname(process.execPath);
+    const { code, stderr } = await spawnAndCollect(
+      ['--port', String(port), 'codex', '--no-browser'],
+      8000,
+      {
+        PATH: `${fakeBin}${path.delimiter}${nodeBin}`,
+        CCXRAY_TEST_CODEX_CAPTURE: capturePath,
+      }
+    );
+
+    assert.equal(code, 0, stderr);
+    const capture = JSON.parse(fs.readFileSync(capturePath, 'utf8'));
+    assert.deepEqual(capture.argv, [
+      '-c',
+      `openai_base_url="http://localhost:${port}/v1"`,
+    ]);
+
+    fs.rmSync(fakeBin, { recursive: true, force: true });
+  });
+
+  it('uses hub discovery and registration for codex mode without explicit port', async () => {
+    const port = await findFreePort();
+    const hubChild = spawnServer(['--port', String(port), '--hub-mode']);
+    await waitForPort(port);
+
+    const { fakeBin, capturePath } = createFakeCodexCapture();
+    const nodeBin = path.dirname(process.execPath);
+    try {
+      const { code, stderr } = await spawnAndCollect(
+        ['codex', 'exec', 'hello'],
+        8000,
+        {
+          PATH: `${fakeBin}${path.delimiter}${nodeBin}`,
+          CCXRAY_TEST_CODEX_CAPTURE: capturePath,
+        }
+      );
+
+      assert.equal(code, 0, stderr);
+      const capture = JSON.parse(fs.readFileSync(capturePath, 'utf8'));
+      assert.deepEqual(capture.argv, [
+        '-c',
+        `openai_base_url="http://localhost:${port}/v1"`,
+        'exec',
+        'hello',
+      ]);
+    } finally {
+      fs.rmSync(fakeBin, { recursive: true, force: true });
+      await killAndWait(hubChild);
+      try { fs.unlinkSync(path.join(TEST_HOME, 'hub.json')); } catch {}
+    }
+  });
+
+  it('forks a Codex-started hub with the default ccxray display name', async () => {
+    const port = await findFreePort();
+    const { fakeBin, capturePath } = createFakeCodexCapture();
+    const nodeBin = path.dirname(process.execPath);
+    try {
+      const { code, stderr } = await spawnAndCollect(
+        ['codex', 'exec', 'hello'],
+        8000,
+        {
+          PATH: `${fakeBin}${path.delimiter}${nodeBin}`,
+          CCXRAY_TEST_CODEX_CAPTURE: capturePath,
+          PROXY_PORT: String(port),
+        }
+      );
+
+      assert.equal(code, 0, stderr);
+      const html = await httpGetRaw(port, '/');
+      assert.ok(html.includes('"APP_NAME":"ccxray"'), html);
+    } finally {
+      fs.rmSync(fakeBin, { recursive: true, force: true });
+      try {
+        const lock = JSON.parse(fs.readFileSync(path.join(TEST_HOME, 'hub.json'), 'utf8'));
+        process.kill(lock.pid, 'SIGTERM');
+      } catch {}
+      try { fs.unlinkSync(path.join(TEST_HOME, 'hub.json')); } catch {}
+    }
+  });
+
+  it('reports a Codex-specific install hint when codex binary is missing', async () => {
+    const port = await findFreePort();
+    const nodeBin = path.dirname(process.execPath);
+    const { stderr, code } = await spawnAndCollect(
+      ['--port', String(port), 'codex'],
+      8000,
+      { PATH: nodeBin }
+    );
+
+    assert.equal(code, 1);
+    assert.ok(stderr.includes('"codex" command not found'), stderr);
+    assert.ok(stderr.includes('@openai/codex'), stderr);
+  });
+});
+
 // ── P0: Proxy end-to-end (request → forward → response → log) ──────
 
 describe('P0: proxy end-to-end forwarding', () => {
@@ -518,6 +673,694 @@ describe('P0: proxy end-to-end forwarding', () => {
     const reqContent = JSON.parse(fs.readFileSync(path.join(logsDir, reqFiles[0]), 'utf8'));
     assert.equal(reqContent.model, 'claude-sonnet-4-20250514');
     assert.ok(reqContent.messages);
+  });
+});
+
+describe('OpenAI upstream routing', () => {
+  let mockUpstream;
+  let mockPort;
+  let proxyChild;
+  let proxyPort;
+  let receivedReq = null;
+  let receivedWsReq = null;
+  let receivedWsMessage = null;
+  let mockWss;
+  const upstreamBody = {
+    id: 'resp_openai_test',
+    object: 'response',
+    model: 'gpt-5.1-codex',
+    output: [{ type: 'message', content: [{ type: 'output_text', text: 'ok' }] }],
+    usage: {
+      input_tokens: 12,
+      output_tokens: 4,
+      total_tokens: 16,
+    },
+  };
+
+  before(async () => {
+    mockUpstream = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        receivedReq = { method: req.method, url: req.url, headers: req.headers, body };
+        if (req.url.startsWith('/v1/models')) {
+          res.writeHead(200, { 'Content-Type': 'application/json', 'x-openai-mock': 'models' });
+          res.end(JSON.stringify({ object: 'list', data: [{ id: 'gpt-5.1-codex', object: 'model' }] }));
+          return;
+        }
+        res.writeHead(201, { 'Content-Type': 'application/json', 'x-openai-mock': 'responses' });
+        res.end(JSON.stringify(upstreamBody));
+      });
+    });
+    mockWss = new WebSocket.WebSocketServer({ noServer: true });
+    mockUpstream.on('upgrade', (req, socket, head) => {
+      mockWss.handleUpgrade(req, socket, head, (ws) => {
+        receivedWsReq = { url: req.url, headers: req.headers };
+        ws.on('message', data => {
+          receivedWsMessage = JSON.parse(data.toString('utf8'));
+          ws.send(JSON.stringify({
+            type: 'response.created',
+            response: { id: 'resp_ws_ok', object: 'response', model: 'gpt-5.1-codex', status: 'in_progress' },
+          }));
+          ws.send(JSON.stringify({ type: 'response.output_text.delta', delta: 'hello ws' }));
+          ws.send(JSON.stringify({
+            type: 'response.completed',
+            response: {
+              id: 'resp_ws_ok',
+              object: 'response',
+              model: 'gpt-5.1-codex',
+              status: 'completed',
+              output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello ws' }] }],
+              usage: { input_tokens: 8, output_tokens: 2, total_tokens: 10 },
+            },
+          }));
+          ws.close(1000, 'done');
+        });
+      });
+    });
+    await new Promise(r => mockUpstream.listen(0, r));
+    mockPort = mockUpstream.address().port;
+
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: {
+        OPENAI_BASE_URL: `http://localhost:${mockPort}/v1`,
+        CHATGPT_BASE_URL: `http://localhost:${mockPort}/backend-api/codex`,
+        OPENAI_TEST_HOST: '',
+        OPENAI_TEST_PORT: '',
+        OPENAI_TEST_PROTOCOL: '',
+      },
+    });
+    await waitForPort(proxyPort);
+  });
+
+  after(async () => {
+    await killAndWait(proxyChild);
+    await new Promise(r => mockWss.close(r));
+    await new Promise(r => mockUpstream.close(r));
+  });
+
+  it('forwards Codex /v1/models probes to the OpenAI upstream', async () => {
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${proxyPort}/v1/models?client_version=0.125.0`, {
+        method: 'GET',
+        headers: { Authorization: 'Bearer test-key' },
+      }, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data) }); }
+          catch { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+
+    assert.ok(receivedReq, 'mock OpenAI upstream should have received the models probe');
+    assert.equal(receivedReq.method, 'GET');
+    assert.equal(receivedReq.url, '/v1/models?client_version=0.125.0');
+    assert.equal(receivedReq.headers.authorization, 'Bearer test-key');
+    assert.equal(response.status, 200);
+    assert.equal(response.headers['x-openai-mock'], 'models');
+    assert.equal(response.body.data[0].id, 'gpt-5.1-codex');
+  });
+
+  it('forwards /v1/responses to OPENAI_BASE_URL while preserving request and response details', async () => {
+    const requestBody = JSON.stringify({
+      model: 'gpt-5.1-codex',
+      instructions: 'Answer concisely.',
+      input: 'test openai routing',
+    });
+
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${proxyPort}/v1/responses?trace=1`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(requestBody),
+          Authorization: 'Bearer test-key',
+          Connection: 'keep-alive, x-remove-me',
+          'x-remove-me': 'drop-me',
+          'accept-encoding': 'gzip',
+        },
+      }, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(data) }); }
+          catch { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on('error', reject);
+      req.end(requestBody);
+    });
+
+    assert.ok(receivedReq, 'mock OpenAI upstream should have received the request');
+    assert.equal(receivedReq.method, 'POST');
+    assert.equal(receivedReq.url, '/v1/responses?trace=1');
+    assert.equal(receivedReq.body, requestBody);
+    assert.equal(receivedReq.headers.host, 'localhost');
+    assert.equal(receivedReq.headers.authorization, 'Bearer test-key');
+    assert.equal(receivedReq.headers['x-remove-me'], undefined);
+    assert.equal(receivedReq.headers['accept-encoding'], undefined);
+    assert.equal(response.status, 201);
+    assert.equal(response.headers['x-openai-mock'], 'responses');
+    assert.deepEqual(response.body, upstreamBody);
+
+    await new Promise(r => setTimeout(r, 300));
+    const logsDir = path.join(TEST_HOME, 'logs');
+    const reqFiles = fs.readdirSync(logsDir).filter(f => f.endsWith('_req.json'));
+    const openAIReqLogs = reqFiles
+      .map(f => JSON.parse(fs.readFileSync(path.join(logsDir, f), 'utf8')))
+      .filter(log => log.provider === 'openai' && log.model === 'gpt-5.1-codex');
+    assert.ok(openAIReqLogs.length > 0, 'expected stripped OpenAI request log');
+    const reqLog = openAIReqLogs.at(-1);
+    assert.equal(reqLog.agent, 'codex');
+    assert.equal(reqLog.path, '/v1/responses?trace=1');
+    assert.equal(reqLog.instructions.summary, 'Answer concisely.');
+    assert.equal(reqLog.input.summary, 'test openai routing');
+    assert.match(reqLog.instructions.hash, /^[a-f0-9]{12}$/);
+    assert.match(reqLog.input.hash, /^[a-f0-9]{12}$/);
+    assert.equal(reqLog.toolsHash, null);
+    assert.equal(reqLog.rawRequest.bytes, Buffer.byteLength(requestBody));
+    assert.match(reqLog.rawRequest.sha256, /^[a-f0-9]{64}$/);
+
+    const entriesPayload = await httpGet(proxyPort, '/_api/entries');
+    const entry = entriesPayload.entries
+      .filter(e => e.provider === 'openai' && e.model === 'gpt-5.1-codex')
+      .at(-1);
+    assert.ok(entry, 'expected OpenAI dashboard entry');
+    const fullEntry = await httpGet(proxyPort, '/_api/entry/' + encodeURIComponent(entry.id));
+    assert.equal(fullEntry.req.instructions, 'Answer concisely.');
+    assert.equal(fullEntry.req.input, 'test openai routing');
+  });
+
+  it('persists structured Responses instructions, input, and tools for dashboard inspection', async () => {
+    const structuredInput = [{
+      role: 'user',
+      content: [{ type: 'input_text', text: 'inspect this structured payload' }],
+    }];
+    const tools = [{
+      type: 'function',
+      name: 'shell',
+      description: 'Run a command',
+      parameters: { type: 'object', properties: { command: { type: 'string' } } },
+    }];
+    const requestBody = JSON.stringify({
+      model: 'gpt-5.1-codex',
+      instructions: 'You are Codex in inspection mode.',
+      input: structuredInput,
+      tools,
+    });
+
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${proxyPort}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(requestBody),
+          Authorization: 'Bearer test-key',
+        },
+      }, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on('error', reject);
+      req.end(requestBody);
+    });
+
+    assert.equal(response.status, 201);
+
+    await new Promise(r => setTimeout(r, 300));
+    const logsDir = path.join(TEST_HOME, 'logs');
+    const sharedDir = path.join(logsDir, 'shared');
+    const reqFiles = fs.readdirSync(logsDir).filter(f => f.endsWith('_req.json'));
+    const reqLog = reqFiles
+      .map(f => JSON.parse(fs.readFileSync(path.join(logsDir, f), 'utf8')))
+      .filter(log => log.provider === 'openai' && log.input?.type === 'array')
+      .at(-1);
+    assert.ok(reqLog, 'expected structured OpenAI request log');
+    assert.match(reqLog.instructions.hash, /^[a-f0-9]{12}$/);
+    assert.match(reqLog.input.hash, /^[a-f0-9]{12}$/);
+    assert.match(reqLog.toolsHash, /^[a-f0-9]{12}$/);
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(sharedDir, `openai_instructions_${reqLog.instructions.hash}.json`), 'utf8')),
+      'You are Codex in inspection mode.'
+    );
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(sharedDir, `openai_input_${reqLog.input.hash}.json`), 'utf8')),
+      structuredInput
+    );
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(path.join(sharedDir, `openai_tools_${reqLog.toolsHash}.json`), 'utf8')),
+      tools
+    );
+
+    const entriesPayload = await httpGet(proxyPort, '/_api/entries');
+    const entry = entriesPayload.entries
+      .filter(e => e.provider === 'openai' && e.toolCount === 1)
+      .at(-1);
+    assert.ok(entry, 'expected inspectable OpenAI dashboard entry');
+    const fullEntry = await httpGet(proxyPort, '/_api/entry/' + encodeURIComponent(entry.id));
+    assert.equal(fullEntry.req.instructions, 'You are Codex in inspection mode.');
+    assert.deepEqual(fullEntry.req.input, structuredInput);
+    assert.deepEqual(fullEntry.req.tools, tools);
+  });
+
+  it('proxies Codex Responses WebSocket traffic and captures dashboard details', async () => {
+    const turnMetadata = {
+      session_id: 'codex-ws-session',
+      thread_source: 'user',
+      turn_id: 'codex-ws-turn',
+      workspaces: { '/tmp/codex-ws-project': { has_changes: false } },
+      sandbox: 'seatbelt',
+    };
+    const payload = {
+      type: 'response.create',
+      model: 'gpt-5.1-codex',
+      instructions: 'Use the websocket path.',
+      input: [{ role: 'user', content: [{ type: 'input_text', text: 'hello from websocket' }] }],
+      tools: [{ type: 'function', name: 'shell', parameters: { type: 'object' } }],
+    };
+
+    const received = [];
+    await new Promise((resolve, reject) => {
+      const ws = new WebSocket(`ws://localhost:${proxyPort}/v1/responses`, {
+        headers: {
+          Authorization: 'Bearer test-key',
+          'chatgpt-account-id': 'acct-test',
+          originator: 'codex_exec',
+          'openai-beta': 'responses_websockets=2026-02-06',
+          'x-codex-turn-metadata': JSON.stringify(turnMetadata),
+          session_id: turnMetadata.session_id,
+        },
+      });
+      ws.on('open', () => ws.send(JSON.stringify(payload)));
+      ws.on('message', data => received.push(JSON.parse(data.toString('utf8'))));
+      ws.on('close', () => resolve());
+      ws.on('error', reject);
+    });
+
+    assert.ok(receivedWsReq, 'mock OpenAI WebSocket upstream should receive an upgrade');
+    assert.equal(receivedWsReq.url, '/backend-api/codex/responses');
+    assert.equal(receivedWsReq.headers.authorization, 'Bearer test-key');
+    assert.equal(receivedWsReq.headers['chatgpt-account-id'], 'acct-test');
+    assert.equal(receivedWsReq.headers['openai-beta'], 'responses_websockets=2026-02-06');
+    assert.equal(receivedWsMessage.model, 'gpt-5.1-codex');
+    assert.deepEqual(receivedWsMessage.input, payload.input);
+    assert.ok(received.some(e => e.type === 'response.completed'));
+
+    await new Promise(r => setTimeout(r, 300));
+    const entriesPayload = await httpGet(proxyPort, '/_api/entries');
+    const entry = entriesPayload.entries
+      .filter(e => e.provider === 'openai' && e.responseMetadata?.websocket)
+      .at(-1);
+    assert.ok(entry, 'expected OpenAI WebSocket dashboard entry');
+    assert.equal(entry.agent, 'codex');
+    assert.equal(entry.method, 'WS');
+    assert.equal(entry.status, 101);
+    assert.equal(entry.model, 'gpt-5.1-codex');
+    assert.equal(entry.cwd, '/tmp/codex-ws-project');
+    assert.equal(entry.responseMetadata.responseStatus, 'completed');
+    assert.deepEqual(entry.usage, {
+      input_tokens: 8,
+      output_tokens: 2,
+      total_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      reasoning_tokens: 0,
+      raw_input_tokens: 8,
+      input_tokens_details: null,
+      output_tokens_details: null,
+    });
+
+    const fullEntry = await httpGet(proxyPort, '/_api/entry/' + encodeURIComponent(entry.id));
+    assert.equal(fullEntry.req.instructions, 'Use the websocket path.');
+    assert.deepEqual(fullEntry.req.input, payload.input);
+    assert.ok(fullEntry.res.some(e => e.event === 'response.output_text.delta' && e.data.delta === 'hello ws'));
+  });
+});
+
+describe('OpenAI upstream failure handling', () => {
+  let proxyChild;
+  let proxyPort;
+
+  after(async () => {
+    if (proxyChild) await killAndWait(proxyChild);
+  });
+
+  it('returns a structured 502 proxy error when the OpenAI upstream is unreachable', async () => {
+    const deadPort = await findFreePort();
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: {
+        OPENAI_TEST_HOST: 'localhost',
+        OPENAI_TEST_PORT: String(deadPort),
+        OPENAI_TEST_PROTOCOL: 'http',
+      },
+    });
+    await waitForPort(proxyPort);
+
+    const requestBody = JSON.stringify({
+      model: 'gpt-5.1-codex',
+      input: 'trigger upstream failure',
+    });
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${proxyPort}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(requestBody),
+          Authorization: 'Bearer test-key',
+        },
+      }, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on('error', reject);
+      req.end(requestBody);
+    });
+
+    assert.equal(response.status, 502);
+    assert.equal(response.body.error, 'proxy_error');
+    assert.ok(response.body.message);
+
+    const health = await httpGet(proxyPort, '/_api/health');
+    assert.deepEqual(health, { ok: true });
+  });
+});
+
+describe('Dual-provider regression coverage', () => {
+  let anthropicUpstream;
+  let openAIUpstream;
+  let anthropicPort;
+  let openAIPort;
+  let proxyChild;
+  let proxyPort;
+  const received = { anthropic: [], openai: [] };
+
+  before(async () => {
+    anthropicUpstream = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        received.anthropic.push({ method: req.method, url: req.url, headers: req.headers, body });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'x-provider-mock': 'anthropic' });
+        res.end(JSON.stringify({
+          id: 'msg_dual_provider',
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'text', text: 'claude ok' }],
+          model: 'claude-sonnet-4-20250514',
+          usage: { input_tokens: 11, output_tokens: 3 },
+        }));
+      });
+    });
+    await new Promise(r => anthropicUpstream.listen(0, r));
+    anthropicPort = anthropicUpstream.address().port;
+
+    openAIUpstream = http.createServer((req, res) => {
+      let body = '';
+      req.on('data', c => { body += c; });
+      req.on('end', () => {
+        received.openai.push({ method: req.method, url: req.url, headers: req.headers, body });
+        res.writeHead(200, { 'Content-Type': 'application/json', 'x-provider-mock': 'openai' });
+        res.end(JSON.stringify({
+          id: 'resp_dual_provider',
+          object: 'response',
+          model: 'gpt-5.1-codex',
+          output: [{ type: 'message', content: [{ type: 'output_text', text: 'codex ok' }] }],
+          usage: { input_tokens: 13, output_tokens: 5, total_tokens: 18 },
+        }));
+      });
+    });
+    await new Promise(r => openAIUpstream.listen(0, r));
+    openAIPort = openAIUpstream.address().port;
+
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: {
+        ANTHROPIC_TEST_HOST: 'localhost',
+        ANTHROPIC_TEST_PORT: String(anthropicPort),
+        ANTHROPIC_TEST_PROTOCOL: 'http',
+        OPENAI_TEST_HOST: 'localhost',
+        OPENAI_TEST_PORT: String(openAIPort),
+        OPENAI_TEST_PROTOCOL: 'http',
+      },
+    });
+    await waitForPort(proxyPort);
+  });
+
+  after(async () => {
+    await killAndWait(proxyChild);
+    await new Promise(r => anthropicUpstream.close(r));
+    await new Promise(r => openAIUpstream.close(r));
+  });
+
+  it('routes Claude and Codex requests through their provider upstreams in the same proxy run', async () => {
+    const claudeBody = JSON.stringify({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 100,
+      messages: [{ role: 'user', content: 'dual claude request' }],
+      metadata: { user_id: JSON.stringify({ session_id: '11112222-3333-4444-5555-666677778888' }) },
+    });
+    const codexBody = JSON.stringify({
+      model: 'gpt-5.1-codex',
+      instructions: 'Use the OpenAI Responses path.',
+      input: 'dual codex request',
+      metadata: { session_id: 'dual-codex-session', cwd: '/tmp/dual-provider' },
+    });
+
+    const claudeResponse = await sendProxyRequest(proxyPort, claudeBody);
+    const codexResponse = await sendOpenAIResponsesRequest(proxyPort, codexBody);
+
+    assert.equal(claudeResponse.status, 200);
+    assert.equal(codexResponse.status, 200);
+    assert.equal(JSON.parse(claudeResponse.body).content[0].text, 'claude ok');
+    assert.equal(JSON.parse(codexResponse.body).output[0].content[0].text, 'codex ok');
+
+    assert.equal(received.anthropic.length, 1, 'Anthropic upstream should receive only Claude traffic');
+    assert.equal(received.openai.length, 1, 'OpenAI upstream should receive only Codex traffic');
+    assert.equal(received.anthropic[0].url, '/v1/messages');
+    assert.equal(received.openai[0].url, '/v1/responses');
+    assert.equal(JSON.parse(received.anthropic[0].body).messages[0].content, 'dual claude request');
+    assert.equal(JSON.parse(received.openai[0].body).input, 'dual codex request');
+
+    await new Promise(r => setTimeout(r, 500));
+    const { entries } = await httpGet(proxyPort, '/_api/entries');
+    const claudeEntry = entries
+      .filter(e => e.provider === 'anthropic' && e.sessionId === '11112222-3333-4444-5555-666677778888')
+      .at(-1);
+    const codexEntry = entries
+      .filter(e => e.provider === 'openai' && e.responseMetadata?.id === 'resp_dual_provider')
+      .at(-1);
+    assert.ok(claudeEntry, 'expected Anthropic dashboard entry');
+    assert.ok(codexEntry, 'expected OpenAI dashboard entry');
+    assert.equal(claudeEntry.agent, 'claude');
+    assert.equal(codexEntry.agent, 'codex');
+    assert.equal(codexEntry.sessionId, 'codex-dual-codex-session');
+
+    const logsDir = path.join(TEST_HOME, 'logs');
+    const indexEntries = fs.readFileSync(path.join(logsDir, 'index.ndjson'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    assert.ok(indexEntries.some(e => e.provider === 'anthropic' && e.id === claudeEntry.id));
+    assert.ok(indexEntries.some(e => e.provider === 'openai' && e.id === codexEntry.id));
+  });
+});
+
+describe('Malformed OpenAI log restore regression', () => {
+  let malformedHome;
+  let proxyChild;
+  let proxyPort;
+
+  before(async () => {
+    malformedHome = fs.mkdtempSync(path.join(os.tmpdir(), 'ccxray-malformed-openai-log-'));
+    const logsDir = path.join(malformedHome, 'logs');
+    fs.mkdirSync(logsDir, { recursive: true });
+    const id = '2026-04-27T12-45-00-000';
+    fs.writeFileSync(path.join(logsDir, 'index.ndjson'), JSON.stringify({
+      id,
+      ts: '12:45:00',
+      provider: 'openai',
+      agent: 'codex',
+      sessionId: 'codex-malformed',
+      method: 'POST',
+      url: '/v1/responses',
+      status: 200,
+      model: 'gpt-5.1-codex',
+      receivedAt: Date.now(),
+    }) + '\n');
+    fs.writeFileSync(path.join(logsDir, `${id}_req.json`), '{"provider":"openai",');
+    fs.writeFileSync(path.join(logsDir, `${id}_res.json`), '{"not valid"');
+
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: { CCXRAY_HOME: malformedHome, RESTORE_DAYS: '0' },
+    });
+    await waitForPort(proxyPort);
+  });
+
+  after(async () => {
+    await killAndWait(proxyChild);
+    fs.rmSync(malformedHome, { recursive: true, force: true });
+  });
+
+  it('starts the dashboard and lazy-loads malformed OpenAI req/res as null/raw data', async () => {
+    const health = await httpGet(proxyPort, '/_api/health');
+    assert.deepEqual(health, { ok: true });
+
+    const { entries } = await httpGet(proxyPort, '/_api/entries');
+    const restored = entries.find(e => e.provider === 'openai' && e.id === '2026-04-27T12-45-00-000');
+    assert.ok(restored, 'expected malformed OpenAI index entry to restore');
+    assert.equal(restored.agent, 'codex');
+
+    const fullEntry = await httpGet(proxyPort, '/_api/entry/' + encodeURIComponent(restored.id));
+    assert.equal(fullEntry.req, null);
+    assert.equal(fullEntry.res, '{"not valid"');
+  });
+});
+
+describe('OpenAI Responses SSE streaming capture', () => {
+  let mockUpstream;
+  let mockPort;
+  let proxyChild;
+  let proxyPort;
+  let sentStream = '';
+
+  before(async () => {
+    mockUpstream = http.createServer((req, res) => {
+      req.resume();
+      req.on('end', () => {
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream; charset=utf-8',
+          'Cache-Control': 'no-cache',
+          'x-openai-stream-test': 'yes',
+        });
+
+        const frames = [
+          'event: response.created\ndata: {"type":"response.created","response":{"id":"resp_stream_ok","model":"gpt-5.1-codex","status":"in_progress"}}\n\n',
+          'event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello "}\n\n',
+          'event: response.output_item.done\ndata: {"type":"response.output_item.done","output_index":0,"item":{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"Hello stream"}]}}\n\n',
+          'event: response.output_text.delta\ndata: {"delta":\n\n',
+          'event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_stream_ok","object":"response","model":"gpt-5.1-codex","status":"completed","output":[{"id":"msg_1","type":"message","content":[{"type":"output_text","text":"Hello stream"}]}],"usage":{"input_tokens":7,"output_tokens":3,"total_tokens":10}}}\n\n',
+        ];
+        sentStream = frames.join('');
+
+        let i = 0;
+        const sendNext = () => {
+          if (i >= frames.length) { res.end(); return; }
+          res.write(frames[i]);
+          i++;
+          setTimeout(sendNext, 5);
+        };
+        sendNext();
+      });
+    });
+    await new Promise(r => mockUpstream.listen(0, r));
+    mockPort = mockUpstream.address().port;
+
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: {
+        OPENAI_BASE_URL: `http://localhost:${mockPort}/v1`,
+        OPENAI_TEST_HOST: '',
+        OPENAI_TEST_PORT: '',
+        OPENAI_TEST_PROTOCOL: '',
+      },
+    });
+    await waitForPort(proxyPort);
+  });
+
+  after(async () => {
+    await killAndWait(proxyChild);
+    await new Promise(r => mockUpstream.close(r));
+  });
+
+  it('passes OpenAI Responses SSE through while logging parsed and malformed events', async () => {
+    const requestBody = JSON.stringify({
+      model: 'gpt-5.1-codex',
+      stream: true,
+      input: 'stream please',
+    });
+
+    const response = await new Promise((resolve, reject) => {
+      const req = http.request(`http://localhost:${proxyPort}/v1/responses`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Content-Length': Buffer.byteLength(requestBody),
+          Authorization: 'Bearer test-key',
+        },
+      }, res => {
+        let data = '';
+        res.on('data', c => { data += c; });
+        res.on('end', () => resolve({ status: res.statusCode, headers: res.headers, body: data }));
+      });
+      req.on('error', reject);
+      req.end(requestBody);
+    });
+
+    assert.equal(response.status, 200);
+    assert.ok((response.headers['content-type'] || '').includes('text/event-stream'));
+    assert.equal(response.headers['x-openai-stream-test'], 'yes');
+    assert.equal(response.body, sentStream);
+
+    await new Promise(r => setTimeout(r, 500));
+    const logsDir = path.join(TEST_HOME, 'logs');
+    const resFiles = fs.readdirSync(logsDir).filter(f => f.endsWith('_res.json'));
+    const matchingEvents = resFiles
+      .map(f => JSON.parse(fs.readFileSync(path.join(logsDir, f), 'utf8')))
+      .filter(events => Array.isArray(events) && events.some(e => e.data?.response?.id === 'resp_stream_ok'))
+      .at(-1);
+
+    assert.ok(matchingEvents, 'expected OpenAI stream response log');
+    assert.ok(matchingEvents.some(e => e.event === 'response.created'));
+    assert.ok(matchingEvents.some(e => e.event === 'response.output_text.delta' && e.data?.delta === 'Hello '));
+    assert.ok(matchingEvents.some(e => e.event === 'response.output_item.done' && e.data?.item?.type === 'message'));
+    assert.ok(matchingEvents.some(e => e.event === 'response.output_text.delta' && e.parseError && e.dataRaw === '{"delta":'));
+
+    const completed = matchingEvents.find(e => e.event === 'response.completed');
+    assert.equal(completed.data.response.status, 'completed');
+    assert.deepEqual(completed.data.response.usage, {
+      input_tokens: 7,
+      output_tokens: 3,
+      total_tokens: 10,
+    });
+
+    const indexLines = fs.readFileSync(path.join(logsDir, 'index.ndjson'), 'utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const indexEntry = indexLines
+      .filter(line => line.provider === 'openai' && line.responseMetadata?.id === 'resp_stream_ok')
+      .at(-1);
+    assert.ok(indexEntry, 'expected OpenAI stream index entry');
+    assert.equal(indexEntry.agent, 'codex');
+    assert.equal(indexEntry.isSSE, true);
+    assert.equal(indexEntry.responseMetadata.responseStatus, 'completed');
+    assert.equal(indexEntry.responseMetadata.outputItems[0].type, 'message');
+    assert.deepEqual(indexEntry.usage, {
+      input_tokens: 7,
+      output_tokens: 3,
+      total_tokens: 10,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      reasoning_tokens: 0,
+      raw_input_tokens: 7,
+      input_tokens_details: null,
+      output_tokens_details: null,
+    });
   });
 });
 
@@ -1330,6 +2173,21 @@ function sendProxyRequest(port, body) {
       let data = '';
       res.on('data', c => { data += c; });
       res.on('end', () => resolve({ status: res.statusCode, body: data }));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+function sendOpenAIResponsesRequest(port, body) {
+  return new Promise((resolve, reject) => {
+    const req = http.request(`http://localhost:${port}/v1/responses`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Authorization: 'Bearer test-key' },
+    }, res => {
+      let data = '';
+      res.on('data', c => { data += c; });
+      res.on('end', () => resolve({ status: res.statusCode, body: data, headers: res.headers }));
     });
     req.on('error', reject);
     req.end(body);

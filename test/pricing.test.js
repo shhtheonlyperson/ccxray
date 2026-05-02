@@ -25,7 +25,14 @@ describe('pricing', () => {
     });
 
     it('returns null for unknown model', () => {
-      assert.equal(getModelPricing('gpt-4o'), null);
+      assert.equal(getModelPricing('made-up-model'), null);
+    });
+
+    it('has fallback pricing for Codex OpenAI models', () => {
+      const p = getModelPricing('gpt-5.1-codex');
+      assert.ok(p);
+      assert.equal(p.input, 1.25);
+      assert.equal(p.cache_read, 0.125);
     });
   });
 
@@ -70,6 +77,19 @@ describe('pricing', () => {
         cache_creation_input_tokens: 0, cache_read_input_tokens: 0,
       }, 'claude-sonnet-4');
       assert.equal(result.cost, 0);
+    });
+
+    it('calculates normalized OpenAI cached input and output cost', () => {
+      const result = calculateCost({
+        input_tokens: 900_000,
+        output_tokens: 1_000_000,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 100_000,
+        reasoning_tokens: 250_000,
+        total_tokens: 2_000_000,
+      }, 'gpt-5.1-codex');
+      // uncached input: $1.125, cached input: $0.0125, output: $10
+      assert.equal(result.cost, 11.1375);
     });
   });
 });

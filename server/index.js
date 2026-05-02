@@ -5,13 +5,21 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const WebSocket = require('ws');
 const config = require('./config');
 const store = require('./store');
 const helpers = require('./helpers');
-const { fetchPricing } = require('./pricing');
+const { fetchPricing, calculateCost } = require('./pricing');
 const { restoreFromLogs, pruneLogs } = require('./restore');
 const { warmUp: warmUpCosts } = require('./cost-budget');
-const { forwardRequest, setStatusLineEnabled, getStatusLineEnabled } = require('./forward');
+const {
+  forwardRequest,
+  setStatusLineEnabled,
+  getStatusLineEnabled,
+  collectOpenAIStreamText,
+  extractOpenAICompletedResponse,
+  extractOpenAIStreamUsage,
+} = require('./forward');
 const { readSettings } = require('./settings');
 const { broadcastSessionStatus, broadcastPendingRequest } = require('./sse-broadcast');
 const { authMiddleware } = require('./auth');
@@ -107,6 +115,423 @@ function serveStatic(url, clientRes) {
   }
 }
 
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+function buildForwardHeaders(clientHeaders, upstream) {
+  const fwdHeaders = { ...clientHeaders };
+  const connectionTokens = String(clientHeaders.connection || '')
+    .split(',')
+    .map(token => token.trim().toLowerCase())
+    .filter(Boolean);
+
+  for (const header of HOP_BY_HOP_HEADERS) delete fwdHeaders[header];
+  for (const header of connectionTokens) delete fwdHeaders[header];
+  delete fwdHeaders['host'];
+  delete fwdHeaders['accept-encoding'];
+  fwdHeaders['host'] = upstream.host;
+  return fwdHeaders;
+}
+
+const WS_CLIENT_HEADERS = new Set([
+  'connection',
+  'host',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'sec-websocket-accept',
+  'sec-websocket-extensions',
+  'sec-websocket-key',
+  'sec-websocket-protocol',
+  'sec-websocket-version',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+]);
+
+function buildWebSocketForwardHeaders(clientHeaders) {
+  const headers = {};
+  for (const [key, value] of Object.entries(clientHeaders || {})) {
+    if (WS_CLIENT_HEADERS.has(key.toLowerCase())) continue;
+    headers[key] = value;
+  }
+  return headers;
+}
+
+function summarizeText(value, maxLen = 240) {
+  if (value == null) return null;
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  const compact = text.replace(/\s+/g, ' ').trim();
+  if (compact.length <= maxLen) return compact;
+  return compact.slice(0, maxLen - 3) + '...';
+}
+
+function getOpenAIInputType(input) {
+  if (Array.isArray(input)) return 'array';
+  if (input == null) return null;
+  return typeof input;
+}
+
+function parseCodexTurnMetadata(headers) {
+  const raw = headers?.['x-codex-turn-metadata'];
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function cwdFromCodexTurnMetadata(meta) {
+  const workspaces = meta?.workspaces;
+  if (!workspaces || typeof workspaces !== 'object') return null;
+  const first = Object.keys(workspaces)[0];
+  return first || null;
+}
+
+function withCodexMetadata(parsedBody, headers) {
+  if (!parsedBody || typeof parsedBody !== 'object') return parsedBody;
+  const meta = parseCodexTurnMetadata(headers);
+  const sessionId = headers?.session_id || meta?.session_id || null;
+  const cwd = cwdFromCodexTurnMetadata(meta);
+  if (!sessionId && !cwd) return parsedBody;
+  const metadata = parsedBody.metadata && typeof parsedBody.metadata === 'object'
+    ? { ...parsedBody.metadata }
+    : {};
+  if (sessionId && !metadata.session_id) metadata.session_id = sessionId;
+  if (cwd && !metadata.cwd) metadata.cwd = cwd;
+  return { ...parsedBody, metadata };
+}
+
+function summarizeCodexInputTitle(input) {
+  if (typeof input === 'string') return summarizeText(input, 80);
+  if (!Array.isArray(input)) return null;
+  for (let i = input.length - 1; i >= 0; i--) {
+    const item = input[i] || {};
+    if (item.role && item.role !== 'user') continue;
+    const content = item.content;
+    if (typeof content === 'string') return summarizeText(content, 80);
+    if (!Array.isArray(content)) continue;
+    const text = content
+      .map(part => part?.text || part?.content || '')
+      .filter(Boolean)
+      .join(' ')
+      .trim();
+    if (text) return summarizeText(text, 80);
+  }
+  return null;
+}
+
+function buildStrippedRequestLog({ parsedBody, rawBody, clientReq, upstream, id, sysHash, toolsHash, instructionsHash, inputHash }) {
+  if (upstream.provider === 'openai') {
+    return {
+      provider: 'openai',
+      agent: 'codex',
+      method: clientReq.method,
+      path: clientReq.url,
+      upstream: {
+        provider: upstream.provider,
+        source: upstream.source,
+        basePath: upstream.basePath || '',
+      },
+      model: parsedBody.model || null,
+      instructions: {
+        summary: summarizeText(parsedBody.instructions),
+        length: typeof parsedBody.instructions === 'string' ? parsedBody.instructions.length : null,
+        hash: instructionsHash,
+      },
+      input: {
+        type: getOpenAIInputType(parsedBody.input),
+        summary: summarizeText(parsedBody.input),
+        hash: inputHash,
+      },
+      toolsHash,
+      toolCount: Array.isArray(parsedBody.tools) ? parsedBody.tools.length : 0,
+      rawRequest: {
+        id,
+        sha256: crypto.createHash('sha256').update(rawBody).digest('hex'),
+        bytes: rawBody.length,
+      },
+    };
+  }
+
+  return {
+    model: parsedBody.model,
+    max_tokens: parsedBody.max_tokens,
+    messages: parsedBody.messages,
+    sysHash,
+    toolsHash,
+  };
+}
+
+function buildOpenAIWebSocketResponseMetadata(completedResponse, statusCode) {
+  const metadata = {
+    provider: 'openai',
+    id: completedResponse?.id || null,
+    object: completedResponse?.object || null,
+    model: completedResponse?.model || null,
+    status: statusCode,
+    streaming: true,
+    websocket: true,
+  };
+  if (completedResponse?.status) metadata.responseStatus = completedResponse.status;
+  if (Array.isArray(completedResponse?.output)) metadata.outputItems = completedResponse.output;
+  return metadata;
+}
+
+function createOpenAIWebSocketEntry(ctx, statusCode) {
+  const { id, ts, startTime, parsedBody, reqSessionId, events } = ctx;
+  const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+  const completedResponse = extractOpenAICompletedResponse(events);
+  const responseUsage = extractOpenAIStreamUsage(events);
+  const responseModel = completedResponse?.model || parsedBody?.model || null;
+  const costInfo = responseUsage ? calculateCost(responseUsage, responseModel) : null;
+  const responseMetadata = buildOpenAIWebSocketResponseMetadata(completedResponse || {}, statusCode);
+  const sessionId = reqSessionId;
+  const maxContext = config.getMaxContext(parsedBody?.model, parsedBody?.system);
+  const title = collectOpenAIStreamText(events).trim().replace(/\s+/g, ' ').slice(0, 80)
+    || summarizeCodexInputTitle(parsedBody?.input)
+    || null;
+  const stopReason = completedResponse?.status || '';
+  const currMsgCount = Array.isArray(parsedBody?.input) ? parsedBody.input.length : 0;
+  const entry = {
+    id, ts, sessionId, method: 'WS', url: ctx.url,
+    provider: 'openai',
+    agent: 'codex',
+    req: parsedBody, res: events,
+    elapsed, status: statusCode, isSSE: true,
+    tokens: helpers.tokenizeRequest(parsedBody),
+    usage: responseUsage, cost: costInfo,
+    responseMetadata,
+    maxContext,
+    cwd: store.sessionMeta[sessionId]?.cwd || null,
+    receivedAt: startTime,
+    thinkingDuration: null,
+    duplicateToolCalls: null,
+    model: responseModel,
+    msgCount: currMsgCount,
+    toolCount: Array.isArray(parsedBody?.tools) ? parsedBody.tools.length : 0,
+    toolCalls: {},
+    isSubagent: false,
+    sessionInferred: ctx.sessionInferred || false,
+    title,
+    stopReason,
+    toolFail: false,
+    sysHash: null,
+    toolsHash: ctx.toolsHash || null,
+    coreHash: null,
+    thinkingStripped: undefined,
+  };
+  entry.hasCredential = helpers.entryHasCredential(entry) || undefined;
+  entry.toolSources = helpers.buildToolSources(entry) || undefined;
+
+  const resWritePromise = config.storage.write(id, '_res.json', JSON.stringify(events))
+    .catch(e => console.error('Write res.json failed:', e.message));
+  entry._writePromise = Promise.all([ctx.reqWritePromise, resWritePromise].filter(Boolean));
+  store.entries.push(entry);
+  store.trimEntries();
+  const { broadcast } = require('./sse-broadcast');
+  broadcast(entry);
+
+  const indexLine = JSON.stringify({
+    id, ts, sessionId,
+    method: entry.method,
+    url: entry.url,
+    provider: entry.provider,
+    agent: entry.agent,
+    model: entry.model, msgCount: entry.msgCount, toolCount: entry.toolCount,
+    toolCalls: entry.toolCalls, isSubagent: entry.isSubagent, sessionInferred: entry.sessionInferred,
+    cwd: entry.cwd, isSSE: true,
+    usage: entry.usage, cost: costInfo, maxContext,
+    responseMetadata,
+    stopReason, title, thinkingDuration: null,
+    toolFail: entry.toolFail,
+    elapsed, status: statusCode,
+    receivedAt: startTime,
+    sysHash: null, toolsHash: ctx.toolsHash || null,
+    coreHash: null,
+    hasCredential: entry.hasCredential,
+    toolSources: entry.toolSources,
+  });
+  config.storage.appendIndex(indexLine + '\n').catch(e => console.error('Write index failed:', e.message));
+  entry.req = null;
+  entry.res = null;
+  entry._loaded = false;
+
+  if (costInfo?.cost != null && sessionId) {
+    store.sessionCosts.set(sessionId, (store.sessionCosts.get(sessionId) || 0) + costInfo.cost);
+  }
+}
+
+function handleOpenAIWebSocketUpgrade(clientReq, socket, head, upstream) {
+  const ts = helpers.taipeiTime();
+  const id = helpers.timestamp();
+  const startTime = Date.now();
+  const wss = new WebSocket.WebSocketServer({ noServer: true });
+
+  wss.handleUpgrade(clientReq, socket, head, (clientWs) => {
+    const upstreamPath = config.joinUpstreamPath(upstream, clientReq.url);
+    const wsProtocol = upstream.protocol === 'http' ? 'ws' : 'wss';
+    const portPart = (upstream.protocol === 'https' && upstream.port === 443) || (upstream.protocol === 'http' && upstream.port === 80)
+      ? ''
+      : `:${upstream.port}`;
+    const upstreamUrl = `${wsProtocol}://${upstream.host}${portPart}${upstreamPath}`;
+    const upstreamWs = new WebSocket(upstreamUrl, {
+      headers: buildWebSocketForwardHeaders(clientReq.headers),
+    });
+
+    let upstreamOpen = false;
+    const pendingClientMessages = [];
+    const events = [];
+    const turnMeta = parseCodexTurnMetadata(clientReq.headers);
+    const cwdFallback = cwdFromCodexTurnMetadata(turnMeta) || hub.lookupClientCwd();
+    const ctx = {
+      id, ts, startTime,
+      url: clientReq.url,
+      parsedBody: null,
+      reqSessionId: null,
+      sessionInferred: false,
+      toolsHash: null,
+      reqWritePromise: null,
+      events,
+    };
+
+    const captureClientMessage = (data, isBinary) => {
+      if (isBinary || ctx.parsedBody) return;
+      let parsedBody = null;
+      const rawBody = Buffer.isBuffer(data) ? data : Buffer.from(data);
+      try { parsedBody = JSON.parse(rawBody.toString('utf8')); } catch {}
+      if (!parsedBody || parsedBody.type !== 'response.create') return;
+
+      parsedBody = withCodexMetadata(parsedBody, clientReq.headers);
+      ctx.parsedBody = parsedBody;
+      const hashJson = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 12);
+      const instructionsHash = parsedBody.instructions != null ? hashJson(parsedBody.instructions) : null;
+      const inputHash = parsedBody.input != null ? hashJson(parsedBody.input) : null;
+      const toolsHash = parsedBody.tools ? hashJson(parsedBody.tools) : null;
+      ctx.toolsHash = toolsHash;
+
+      if (instructionsHash) config.storage.writeSharedIfAbsent(`openai_instructions_${instructionsHash}.json`, JSON.stringify(parsedBody.instructions))
+        .catch(e => console.error('Write OpenAI instructions failed:', e.message));
+      if (inputHash) config.storage.writeSharedIfAbsent(`openai_input_${inputHash}.json`, JSON.stringify(parsedBody.input))
+        .catch(e => console.error('Write OpenAI input failed:', e.message));
+      if (toolsHash) config.storage.writeSharedIfAbsent(`openai_tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
+        .catch(e => console.error('Write OpenAI tools failed:', e.message));
+
+      const reqLog = buildStrippedRequestLog({
+        parsedBody,
+        rawBody,
+        clientReq: { method: 'WS', url: clientReq.url },
+        upstream,
+        id,
+        sysHash: null,
+        toolsHash,
+        instructionsHash,
+        inputHash,
+      });
+      ctx.reqWritePromise = config.storage.write(id, '_req.json', JSON.stringify(reqLog))
+        .catch(e => console.error('Write req.json failed:', e.message));
+
+      const detected = store.detectSession(parsedBody, { provider: 'openai', cwdFallback });
+      ctx.reqSessionId = detected.sessionId;
+      ctx.sessionInferred = detected.inferred || false;
+      if (ctx.reqSessionId) {
+        if (!store.sessionMeta[ctx.reqSessionId]) store.sessionMeta[ctx.reqSessionId] = {};
+        store.sessionMeta[ctx.reqSessionId].provider = 'openai';
+        store.sessionMeta[ctx.reqSessionId].cwd = store.extractCwdForProvider(parsedBody, 'openai') || cwdFallback || null;
+        store.sessionMeta[ctx.reqSessionId].lastSeenAt = Date.now();
+        store.activeRequests[ctx.reqSessionId] = (store.activeRequests[ctx.reqSessionId] || 0) + 1;
+        broadcastSessionStatus(ctx.reqSessionId);
+      }
+      if (detected.isNewSession) store.printSessionBanner(ctx.reqSessionId);
+
+      helpers.printSeparator();
+      console.log(`\x1b[36m📤 [${ts}]  [codex ws]  WS ${clientReq.url}\x1b[0m`);
+      console.log(helpers.summarizeRequest(parsedBody));
+    };
+
+    const captureUpstreamMessage = (data, isBinary) => {
+      if (isBinary) return;
+      const text = Buffer.isBuffer(data) ? data.toString('utf8') : String(data);
+      let event = null;
+      try { event = JSON.parse(text); } catch {}
+      if (!event || typeof event !== 'object') return;
+      events.push({ event: event.type || null, type: event.type || null, data: event, _ts: Date.now() });
+    };
+
+    upstreamWs.on('open', () => {
+      upstreamOpen = true;
+      for (const item of pendingClientMessages) upstreamWs.send(item.data, { binary: item.isBinary });
+      pendingClientMessages.length = 0;
+    });
+
+    clientWs.on('message', (data, isBinary) => {
+      captureClientMessage(data, isBinary);
+      if (upstreamOpen) upstreamWs.send(data, { binary: isBinary });
+      else pendingClientMessages.push({ data, isBinary });
+    });
+
+    upstreamWs.on('message', (data, isBinary) => {
+      captureUpstreamMessage(data, isBinary);
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.send(data, { binary: isBinary });
+    });
+
+    upstreamWs.on('error', (err) => {
+      console.error(`\x1b[31m❌ OPENAI WS UPSTREAM ERROR: ${err.message}\x1b[0m`);
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.close(1011, 'upstream_error');
+    });
+    if (!process.versions.bun) {
+      upstreamWs.on('unexpected-response', (_req, res) => {
+        let body = '';
+        res.on('data', chunk => { body += chunk; });
+        res.on('end', () => {
+          const summary = body ? `: ${body.slice(0, 240)}` : '';
+          console.error(`\x1b[31m❌ OPENAI WS UPSTREAM STATUS: ${res.statusCode} ${res.statusMessage}${summary}\x1b[0m`);
+        });
+      });
+    }
+    clientWs.on('error', () => {});
+
+    const finish = () => {
+      if (ctx._finished) return;
+      ctx._finished = true;
+      if (ctx.reqSessionId) {
+        store.activeRequests[ctx.reqSessionId] = Math.max(0, (store.activeRequests[ctx.reqSessionId] || 1) - 1);
+        broadcastSessionStatus(ctx.reqSessionId);
+      }
+      if (!ctx.parsedBody) return;
+      createOpenAIWebSocketEntry(ctx, 101);
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      const usage = extractOpenAIStreamUsage(events);
+      const completed = extractOpenAICompletedResponse(events);
+      const outTok = usage?.output_tokens ? `  out=${usage.output_tokens.toLocaleString()} tok` : '';
+      const status = completed?.status || 'closed';
+      console.log(`\x1b[32m📥 [${helpers.taipeiTime()}]  [codex ws]  ✓ ${status}  ${elapsed}s${outTok}\x1b[0m`);
+      helpers.printSeparator();
+      console.log();
+    };
+
+    upstreamWs.on('close', (code, reason) => {
+      if (clientWs.readyState === WebSocket.OPEN) clientWs.close(code, reason);
+      finish();
+    });
+    clientWs.on('close', (code, reason) => {
+      if (upstreamWs.readyState === WebSocket.OPEN) upstreamWs.close(code, reason);
+      finish();
+    });
+  });
+}
+
 // ── Server ──────────────────────────────────────────────────────────
 const server = http.createServer((clientReq, clientRes) => {
 
@@ -147,36 +572,49 @@ const server = http.createServer((clientReq, clientRes) => {
     // Quota-check probes: forward to Anthropic (rate limit headers still captured)
     // but skip all logging, session tracking, and entry creation
     if (parsedBody && store.isQuotaCheck(parsedBody)) {
-      const fwdHeaders = { ...clientReq.headers };
-      delete fwdHeaders['host'];
-      delete fwdHeaders['connection'];
-      delete fwdHeaders['accept-encoding'];
-      fwdHeaders['host'] = config.ANTHROPIC_HOST;
-      forwardRequest({ id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId: null, reqWritePromise: null, skipEntry: true });
+      const upstream = config.getUpstreamForRequestAndHeaders(clientReq.url, clientReq.headers);
+      const fwdHeaders = buildForwardHeaders(clientReq.headers, upstream);
+      forwardRequest({ id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId: null, reqWritePromise: null, skipEntry: true, upstream });
       return;
     }
+
+    const upstream = config.getUpstreamForRequestAndHeaders(clientReq.url, clientReq.headers);
+    const provider = upstream.provider || 'anthropic';
+    const cwdFallback = provider === 'openai' ? hub.lookupClientCwd() : null;
 
     let reqWritePromise = null;
     let sysHash = null;
     let toolsHash = null;
+    let instructionsHash = null;
+    let inputHash = null;
     if (parsedBody) {
-      sysHash = parsedBody.system
-        ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.system)).digest('hex').slice(0, 12)
-        : null;
-      toolsHash = parsedBody.tools
-        ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.tools)).digest('hex').slice(0, 12)
-        : null;
+      const hashJson = value => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 12);
+      sysHash = parsedBody.system ? hashJson(parsedBody.system) : null;
+      toolsHash = parsedBody.tools ? hashJson(parsedBody.tools) : null;
+      instructionsHash = provider === 'openai' && parsedBody.instructions != null ? hashJson(parsedBody.instructions) : null;
+      inputHash = provider === 'openai' && parsedBody.input != null ? hashJson(parsedBody.input) : null;
 
-      if (sysHash) config.storage.writeSharedIfAbsent(`sys_${sysHash}.json`, JSON.stringify(parsedBody.system))
-        .catch(e => console.error('Write sys failed:', e.message));
-      if (toolsHash) config.storage.writeSharedIfAbsent(`tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
-        .catch(e => console.error('Write tools failed:', e.message));
+      if (provider === 'openai') {
+        if (instructionsHash) config.storage.writeSharedIfAbsent(`openai_instructions_${instructionsHash}.json`, JSON.stringify(parsedBody.instructions))
+          .catch(e => console.error('Write OpenAI instructions failed:', e.message));
+        if (inputHash) config.storage.writeSharedIfAbsent(`openai_input_${inputHash}.json`, JSON.stringify(parsedBody.input))
+          .catch(e => console.error('Write OpenAI input failed:', e.message));
+        if (toolsHash) config.storage.writeSharedIfAbsent(`openai_tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
+          .catch(e => console.error('Write OpenAI tools failed:', e.message));
+      } else {
+        if (sysHash) config.storage.writeSharedIfAbsent(`sys_${sysHash}.json`, JSON.stringify(parsedBody.system))
+          .catch(e => console.error('Write sys failed:', e.message));
+        if (toolsHash) config.storage.writeSharedIfAbsent(`tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
+          .catch(e => console.error('Write tools failed:', e.message));
+      }
 
       const currMessages = Array.isArray(parsedBody.messages) ? parsedBody.messages : [];
       const peekSid = store.extractSessionId(parsedBody);
       let stripped;
 
-      if (peekSid && config.storage.supportsDelta) {
+      if (upstream.provider === 'openai') {
+        stripped = buildStrippedRequestLog({ parsedBody, rawBody, clientReq, upstream, id, sysHash, toolsHash, instructionsHash, inputHash });
+      } else if (peekSid && config.storage.supportsDelta) {
         const prev = sessionLastReq.get(peekSid);
         const sharedCount = prev ? findSharedPrefix(prev.messages, currMessages) : 0;
         const forceFull = !prev ||
@@ -206,14 +644,15 @@ const server = http.createServer((clientReq, clientRes) => {
     }
 
     const { sessionId: reqSessionId, isNewSession, inferred: sessionInferred } = parsedBody
-      ? store.detectSession(parsedBody)
+      ? store.detectSession(parsedBody, { provider, cwdFallback })
       : { sessionId: store.getCurrentSessionId(), isNewSession: false };
 
     // Extract and store cwd
     if (parsedBody && reqSessionId) {
-      const cwd = store.extractCwd(parsedBody);
+      const cwd = store.extractCwdForProvider(parsedBody, provider) || cwdFallback;
       if (cwd) {
         if (!store.sessionMeta[reqSessionId]) store.sessionMeta[reqSessionId] = {};
+        store.sessionMeta[reqSessionId].provider = provider;
         store.sessionMeta[reqSessionId].cwd = cwd;
       }
     }
@@ -253,6 +692,7 @@ const server = http.createServer((clientReq, clientRes) => {
     if (reqSessionId) {
       store.activeRequests[reqSessionId] = (store.activeRequests[reqSessionId] || 0) + 1;
       if (!store.sessionMeta[reqSessionId]) store.sessionMeta[reqSessionId] = {};
+      store.sessionMeta[reqSessionId].provider = provider;
       store.sessionMeta[reqSessionId].lastSeenAt = Date.now();
       broadcastSessionStatus(reqSessionId);
     }
@@ -263,13 +703,9 @@ const server = http.createServer((clientReq, clientRes) => {
     if (isNewSession) store.printSessionBanner(reqSessionId);
 
     // Build context for forwarding
-    const fwdHeaders = { ...clientReq.headers };
-    delete fwdHeaders['host'];
-    delete fwdHeaders['connection'];
-    delete fwdHeaders['accept-encoding'];
-    fwdHeaders['host'] = config.ANTHROPIC_HOST;
+    const fwdHeaders = buildForwardHeaders(clientReq.headers, upstream);
 
-    const ctx = { id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId, reqWritePromise, sysHash, toolsHash, coreHash, sessionInferred };
+    const ctx = { id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId, reqWritePromise, sysHash, toolsHash, instructionsHash, inputHash, coreHash, sessionInferred, upstream };
 
     // ── Intercept check ──
     const lastStop = store.sessionMeta[reqSessionId]?.lastStopReason;
@@ -293,6 +729,16 @@ const server = http.createServer((clientReq, clientRes) => {
 
     forwardRequest(ctx);
   });
+});
+
+server.on('upgrade', (clientReq, socket, head) => {
+  const upstream = config.getUpstreamForRequestAndHeaders(clientReq.url, clientReq.headers);
+  if (upstream.provider !== 'openai') {
+    socket.write('HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n');
+    socket.destroy();
+    return;
+  }
+  handleOpenAIWebSocketUpgrade(clientReq, socket, head, upstream);
 });
 
 
@@ -502,6 +948,9 @@ async function startServer() {
     const upstreamUrl = `${config.ANTHROPIC_PROTOCOL}://${config.ANTHROPIC_HOST}:${config.ANTHROPIC_PORT}`;
     const upstreamNote = config.ANTHROPIC_BASE_URL_SOURCE === 'ANTHROPIC_BASE_URL' ? ' (from ANTHROPIC_BASE_URL)' : '';
     console.log(`   Upstream → ${upstreamUrl}${upstreamNote}`);
+    const openaiUrl = `${config.OPENAI_PROTOCOL}://${config.OPENAI_HOST}:${config.OPENAI_PORT}${config.OPENAI_BASE_PATH}`;
+    const openaiNote = config.OPENAI_BASE_URL_SOURCE === 'OPENAI_BASE_URL' ? ' (from OPENAI_BASE_URL)' : '';
+    console.log(`   OpenAI Upstream → ${openaiUrl}${openaiNote}`);
     console.log(`   Logs → ${config.LOGS_DIR}`);
     console.log();
     console.log(`   Usage: ANTHROPIC_BASE_URL=http://localhost:${actualPort} claude\x1b[0m`);
@@ -540,7 +989,7 @@ async function startServer() {
     return;
   }
 
-  // Claude mode without explicit port: try hub discovery
+  // Agent mode without explicit port: try hub discovery
   const existingHub = await hub.discoverHub(config.PORT);
   if (existingHub) {
     await startClientMode(existingHub);
@@ -550,7 +999,7 @@ async function startServer() {
   // No hub found: acquire fork lock to prevent duplicate hub forks
   const acquired = hub.tryAcquireForkLock();
   if (acquired) {
-    hub.forkHub(config.PORT);
+    hub.forkHub(config.PORT, { displayName: DISPLAY_NAME });
   }
   try {
     const lock = await hub.waitForHubReady();

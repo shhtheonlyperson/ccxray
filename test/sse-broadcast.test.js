@@ -71,5 +71,34 @@ describe('sse-broadcast', () => {
       assert.equal(summary.toolCount, 5, 'should use pre-computed toolCount, not req.tools.length');
       assert.equal(summary.stopReason, 'tool_use', 'should use pre-computed stopReason, not res delta');
     });
+
+    it('preserves provider-aware Codex summary fields without usage or output data', () => {
+      const entry = {
+        id: 'test-003', ts: '14:30:22', sessionId: 'codex-abc123def456',
+        provider: 'openai', agent: 'codex',
+        method: 'POST', url: '/v1/responses',
+        elapsed: '0.4', status: 200, isSSE: false,
+        usage: null, cost: null, maxContext: 200000,
+        cwd: '/tmp/project', receivedAt: Date.now(),
+        model: 'gpt-5.1-codex',
+        msgCount: 0,
+        toolCount: 0,
+        toolCalls: {},
+        isSubagent: false,
+        title: null,
+        stopReason: '',
+        responseMetadata: { provider: 'openai', id: 'resp_1', status: 200 },
+        tokens: null,
+        req: null, res: null, _loaded: false,
+      };
+
+      const summary = summarizeEntry(entry);
+
+      assert.equal(summary.provider, 'openai');
+      assert.equal(summary.agent, 'codex');
+      assert.equal(summary.sessionId, 'codex-abc123def456');
+      assert.equal(summary.usage, null);
+      assert.deepEqual(summary.responseMetadata, { provider: 'openai', id: 'resp_1', status: 200 });
+    });
   });
 });

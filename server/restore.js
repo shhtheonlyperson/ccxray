@@ -15,34 +15,64 @@ function loadEntryReqRes(entry) {
     if (entry._writePromise) await entry._writePromise.catch(() => {});
     try {
       const stripped = JSON.parse(await config.storage.read(entry.id, '_req.json'));
-      const sys = stripped.sysHash
-        ? await config.storage.readShared(`sys_${stripped.sysHash}.json`).then(JSON.parse).catch(() => null)
-        : null;
-      const tools = stripped.toolsHash
-        ? await config.storage.readShared(`tools_${stripped.toolsHash}.json`).then(JSON.parse).catch(() => null)
-        : null;
+      if (stripped.provider === 'openai') {
+        const instructionsHash = stripped.instructions?.hash || stripped.instructionsHash || null;
+        const inputHash = stripped.input?.hash || stripped.inputHash || null;
+        const toolsHash = stripped.toolsHash || null;
+        const instructions = instructionsHash
+          ? await config.storage.readShared(`openai_instructions_${instructionsHash}.json`).then(JSON.parse).catch(() => null)
+          : null;
+        const input = inputHash
+          ? await config.storage.readShared(`openai_input_${inputHash}.json`).then(JSON.parse).catch(() => null)
+          : null;
+        const tools = toolsHash
+          ? await config.storage.readShared(`openai_tools_${toolsHash}.json`).then(JSON.parse).catch(() => null)
+          : null;
+        entry.req = {
+          ...stripped,
+          instructions: instructions != null ? instructions : stripped.instructions,
+          input: input != null ? input : stripped.input,
+          tools,
+        };
+        delete entry.req.instructionsHash;
+        delete entry.req.inputHash;
+        delete entry.req.toolsHash;
+        if (entry.req.instructions && typeof entry.req.instructions === 'object' && 'hash' in entry.req.instructions && instructions == null) {
+          delete entry.req.instructions.hash;
+        }
+        if (entry.req.input && typeof entry.req.input === 'object' && 'hash' in entry.req.input && input == null) {
+          delete entry.req.input.hash;
+        }
+      } else {
+        const sys = stripped.sysHash
+          ? await config.storage.readShared(`sys_${stripped.sysHash}.json`).then(JSON.parse).catch(() => null)
+          : null;
+        const tools = stripped.toolsHash
+          ? await config.storage.readShared(`tools_${stripped.toolsHash}.json`).then(JSON.parse).catch(() => null)
+          : null;
 
-      // Delta format: reconstruct full messages by following prevId chain.
-      // Each hop loads the previous entry (itself potentially a delta) via the
-      // same lazy-load mechanism, so the chain is resolved depth-first with
-      // per-entry promise deduplication. Missing prev entries (pruned) degrade
-      // gracefully — the delta portion is returned as-is.
-      let messages = stripped.messages || [];
-      if (stripped.prevId != null && stripped.msgOffset != null) {
-        const prevEntry = store.entries.find(e => e.id === stripped.prevId);
-        if (prevEntry) {
-          await loadEntryReqRes(prevEntry);
-          if (Array.isArray(prevEntry.req?.messages)) {
-            messages = [...prevEntry.req.messages.slice(0, stripped.msgOffset), ...messages];
+        // Delta format: reconstruct full messages by following prevId chain.
+        // Each hop loads the previous entry (itself potentially a delta) via the
+        // same lazy-load mechanism, so the chain is resolved depth-first with
+        // per-entry promise deduplication. Missing prev entries (pruned) degrade
+        // gracefully — the delta portion is returned as-is.
+        let messages = stripped.messages || [];
+        if (stripped.prevId != null && stripped.msgOffset != null) {
+          const prevEntry = store.entries.find(e => e.id === stripped.prevId);
+          if (prevEntry) {
+            await loadEntryReqRes(prevEntry);
+            if (Array.isArray(prevEntry.req?.messages)) {
+              messages = [...prevEntry.req.messages.slice(0, stripped.msgOffset), ...messages];
+            }
           }
         }
-      }
 
-      entry.req = { ...stripped, system: sys, tools, messages };
-      delete entry.req.sysHash;
-      delete entry.req.toolsHash;
-      delete entry.req.prevId;
-      delete entry.req.msgOffset;
+        entry.req = { ...stripped, system: sys, tools, messages };
+        delete entry.req.sysHash;
+        delete entry.req.toolsHash;
+        delete entry.req.prevId;
+        delete entry.req.msgOffset;
+      }
     } catch { entry.req = null; }
     try {
       const raw = await config.storage.read(entry.id, '_res.json');
@@ -100,6 +130,7 @@ async function restoreFromLogs() {
 
     if (meta.sessionId) {
       if (!store.sessionMeta[meta.sessionId]) store.sessionMeta[meta.sessionId] = {};
+      store.sessionMeta[meta.sessionId].provider = meta.provider || 'anthropic';
       if (meta.cwd) store.sessionMeta[meta.sessionId].cwd = meta.cwd;
       if (meta.receivedAt) store.sessionMeta[meta.sessionId].lastSeenAt = meta.receivedAt;
     }

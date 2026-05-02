@@ -1,5 +1,7 @@
 'use strict';
 
+const crypto = require('crypto');
+
 // ── In-memory store & SSE clients ───────────────────────────────────
 const MAX_ENTRIES = parseInt(process.env.CCXRAY_MAX_ENTRIES || '5000', 10);
 const entries = [];
@@ -16,6 +18,7 @@ let rateLimitState = null;
 
 // ── Session tracking ────────────────────────────────────────────────
 let currentSessionId = null;
+const currentSessionIdByProvider = { anthropic: null, openai: null };
 let lastMsgCount = 0;
 let sessionCounter = 0;
 
@@ -45,6 +48,47 @@ function extractCwd(req) {
   return m ? m[1].trim() : null;
 }
 
+function collectText(value, out = []) {
+  if (typeof value === 'string') {
+    out.push(value);
+  } else if (Array.isArray(value)) {
+    for (const item of value) collectText(item, out);
+  } else if (value && typeof value === 'object') {
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'cwd' || key === 'current_working_directory' || key === 'working_directory' || key === 'project_root') {
+        if (typeof child === 'string') out.push(`${key}: ${child}`);
+      }
+      collectText(child, out);
+    }
+  }
+  return out;
+}
+
+function extractCodexCwd(req) {
+  const metadata = req?.metadata;
+  if (metadata && typeof metadata === 'object') {
+    const direct = metadata.cwd || metadata.current_working_directory || metadata.working_directory || metadata.project_root;
+    if (typeof direct === 'string' && direct.trim()) return direct.trim();
+  }
+
+  const text = collectText([req?.instructions, req?.input, req?.metadata]).join('\n');
+  if (!text) return null;
+  const patterns = [
+    /<cwd>\s*([^<\n]+)\s*<\/cwd>/i,
+    /(?:current working directory|working directory|project root|cwd)\s*[:=]\s*([^\n]+)/i,
+    /Primary working directory:\s*(.+)/i,
+  ];
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return match[1].trim();
+  }
+  return null;
+}
+
+function extractCwdForProvider(req, provider) {
+  return provider === 'openai' ? extractCodexCwd(req) : extractCwd(req);
+}
+
 function extractSessionId(req) {
   const uid = req?.metadata?.user_id || '';
   // New format: user_id is JSON like {"session_id":"xxx-yyy"}
@@ -53,6 +97,22 @@ function extractSessionId(req) {
   // Legacy format: user_id is "session_xxx-yyy"
   const m = uid.match(/session_([a-f0-9-]+)/);
   return m ? m[1] : null;
+}
+
+function extractOpenAISessionId(req) {
+  const meta = req?.metadata;
+  if (meta && typeof meta === 'object') {
+    for (const key of ['session_id', 'sessionId', 'conversation_id', 'conversationId', 'thread_id', 'threadId']) {
+      if (typeof meta[key] === 'string' && meta[key].trim()) return `codex-${meta[key].trim()}`;
+    }
+  }
+  return null;
+}
+
+function codexFallbackSessionId(req, cwdFallback) {
+  const cwd = extractCodexCwd(req) || cwdFallback || 'direct-api';
+  const hash = crypto.createHash('sha1').update(String(cwd)).digest('hex').slice(0, 12);
+  return `codex-${hash}`;
 }
 
 // Bare subagent requests: no session_id, no system prompt, no tools, 1-2 messages.
@@ -71,13 +131,14 @@ function isLikelySubagent(req) {
 // Find the best parent session for an orphan subagent request.
 // Scoring: inflight sessions get massive priority boost, then sorted by recency.
 // Only considers sessions active within the last 30s to avoid stale attribution.
-function inferParentSession() {
+function inferParentSession(provider = 'anthropic') {
   const now = Date.now();
   const WINDOW_MS = 30000;
   let best = null, bestScore = -1;
 
   for (const [sid, meta] of Object.entries(sessionMeta)) {
     if (sid === 'direct-api') continue;
+    if ((meta.provider || 'anthropic') !== provider) continue;
     const seenAt = meta.lastSeenAt || 0;
     if (now - seenAt > WINDOW_MS) continue;
 
@@ -149,52 +210,72 @@ function attributeTitleGen(parsedBody, receivedAt, windowMs = 1000) {
   return matches.length === 1 ? matches[0] : null;
 }
 
-function detectSession(req) {
-  const realId = extractSessionId(req);
+function detectSession(req, opts = {}) {
+  const provider = opts.provider || 'anthropic';
+  const realId = provider === 'openai' ? extractOpenAISessionId(req) : extractSessionId(req);
+  const providerCurrentSessionId = currentSessionIdByProvider[provider] || null;
 
   // Explicit session_id → authoritative.
   // isNewSession reflects "first time we have ever seen this sid",
   // not "different from the last sid" — switching A→B→A only banners A once.
   if (realId) {
     const meta = sessionMeta[realId] || (sessionMeta[realId] = {});
+    meta.provider = provider;
     const isNew = !meta.bannerPrinted;
     if (isNew) {
       meta.bannerPrinted = true;
       sessionCounter++;
     }
-    currentSessionId = realId; // always update last-seen pointer for getCurrentSessionId fallback
+    currentSessionIdByProvider[provider] = realId;
+    if (provider === 'anthropic') currentSessionId = realId; // legacy fallback pointer
     lastMsgCount = req?.messages?.length || 0;
     recordFirstUserMsg(realId, req);
-    return { sessionId: currentSessionId, isNewSession: isNew };
+    return { sessionId: realId, isNewSession: isNew };
+  }
+
+  if (provider === 'openai') {
+    const fallbackId = codexFallbackSessionId(req, opts.cwdFallback);
+    const meta = sessionMeta[fallbackId] || (sessionMeta[fallbackId] = {});
+    meta.provider = 'openai';
+    const isNew = !meta.bannerPrinted;
+    if (isNew) {
+      meta.bannerPrinted = true;
+      sessionCounter++;
+    }
+    currentSessionIdByProvider.openai = fallbackId;
+    lastMsgCount = Array.isArray(req?.input) ? req.input.length : 0;
+    return { sessionId: fallbackId, isNewSession: isNew, inferred: true };
   }
 
   // Likely subagent → infer parent, never pollute global state
   if (isLikelySubagent(req)) {
-    const parent = inferParentSession();
+    const parent = inferParentSession(provider);
     if (parent) return { sessionId: parent, isNewSession: false, inferred: true };
     // No recent session → keep as-is, don't create spurious session
-    return { sessionId: currentSessionId || 'direct-api', isNewSession: false, inferred: true };
+    return { sessionId: providerCurrentSessionId || 'direct-api', isNewSession: false, inferred: true };
   }
 
   // Non-subagent without session_id: try parent attribution before creating a phantom
   // session. Title-gen and other internal requests that don't pass isLikelySubagent
   // (e.g. due to message count) still belong to an existing session when one is active.
-  const parent = inferParentSession();
+  const parent = inferParentSession(provider);
   if (parent) return { sessionId: parent, isNewSession: false, inferred: true };
 
   // True fallback: no active session within 30s → genuine new direct-api session.
   // direct-api re-banners on conversation reset (msg count drops) — that is a
   // distinct conversation under the same sentinel id, treated as a new session.
   const dMeta = sessionMeta['direct-api'] || (sessionMeta['direct-api'] = {});
+  dMeta.provider = 'anthropic';
   const isReset = (req?.messages?.length || 0) < lastMsgCount;
   const isNew = !dMeta.bannerPrinted || isReset;
   if (isNew) {
     dMeta.bannerPrinted = true;
     sessionCounter++;
     currentSessionId = 'direct-api';
+    currentSessionIdByProvider.anthropic = 'direct-api';
   }
   lastMsgCount = req?.messages?.length || 0;
-  return { sessionId: currentSessionId, isNewSession: isNew };
+  return { sessionId: currentSessionIdByProvider.anthropic || currentSessionId || 'direct-api', isNewSession: isNew };
 }
 
 function printSessionBanner(sessionId) {
@@ -235,7 +316,10 @@ module.exports = {
   getCurrentSessionId,
   isQuotaCheck,
   extractCwd,
+  extractCodexCwd,
+  extractCwdForProvider,
   extractSessionId,
+  extractOpenAISessionId,
   detectSession,
   printSessionBanner,
   extractFirstUserMsgText,

@@ -2,7 +2,18 @@
 
 const { describe, it, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
-const { resolveProxyAgent, applyModelPrefix, stripInjectedStats, setStatusLineEnabled, getStatusLineEnabled } = require('../server/forward');
+const {
+  resolveProxyAgent,
+  applyModelPrefix,
+  stripInjectedStats,
+  setStatusLineEnabled,
+  getStatusLineEnabled,
+  parseSSEFrame,
+  extractOpenAIUsage,
+  extractOpenAIStreamUsage,
+  extractOpenAICompletedResponse,
+  collectOpenAIStreamText,
+} = require('../server/forward');
 
 describe('resolveProxyAgent', () => {
   it('returns null when no proxy env vars are set', () => {
@@ -124,5 +135,91 @@ describe('statusLineEnabled flag', () => {
     setStatusLineEnabled(false);
     setStatusLineEnabled(true);
     assert.equal(getStatusLineEnabled(), true);
+  });
+});
+
+describe('OpenAI Responses SSE helpers', () => {
+  it('parses OpenAI event names and JSON data without Anthropic event assumptions', () => {
+    const frame = parseSSEFrame([
+      'event: response.output_text.delta',
+      'data: {"type":"response.output_text.delta","delta":"hello"}',
+    ].join('\n'), 123);
+
+    assert.equal(frame.event, 'response.output_text.delta');
+    assert.equal(frame.type, 'response.output_text.delta');
+    assert.equal(frame.data.delta, 'hello');
+    assert.equal(frame._ts, 123);
+  });
+
+  it('keeps malformed SSE data as raw parse-tolerant text', () => {
+    const frame = parseSSEFrame('event: response.output_text.delta\ndata: {"delta":', 123);
+
+    assert.equal(frame.event, 'response.output_text.delta');
+    assert.equal(frame.type, 'response.output_text.delta');
+    assert.equal(frame.parseError, true);
+    assert.equal(frame.dataRaw, '{"delta":');
+    assert.ok(frame.raw.includes('data: {"delta":'));
+  });
+
+  it('extracts final completed response, text, and usage from OpenAI Responses events', () => {
+    const events = [
+      parseSSEFrame('event: response.created\ndata: {"type":"response.created","response":{"id":"resp_1","status":"in_progress"}}'),
+      parseSSEFrame('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"Hello "}'),
+      parseSSEFrame('event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":"world"}'),
+      parseSSEFrame('event: response.completed\ndata: {"type":"response.completed","response":{"id":"resp_1","model":"gpt-5.1-codex","status":"completed","usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}'),
+    ];
+
+    assert.equal(extractOpenAICompletedResponse(events).status, 'completed');
+    assert.equal(collectOpenAIStreamText(events), 'Hello world');
+    assert.deepEqual(extractOpenAIStreamUsage(events), {
+      input_tokens: 3,
+      output_tokens: 2,
+      total_tokens: 5,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      reasoning_tokens: 0,
+      raw_input_tokens: 3,
+      input_tokens_details: null,
+      output_tokens_details: null,
+    });
+  });
+
+  it('normalizes Responses usage with cached input and reasoning details', () => {
+    const usage = extractOpenAIUsage({
+      usage: {
+        input_tokens: 1_000,
+        output_tokens: 300,
+        total_tokens: 1_300,
+        input_tokens_details: { cached_tokens: 250 },
+        output_tokens_details: { reasoning_tokens: 120 },
+      },
+    });
+
+    assert.deepEqual(usage, {
+      input_tokens: 750,
+      output_tokens: 300,
+      total_tokens: 1_300,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 250,
+      reasoning_tokens: 120,
+      raw_input_tokens: 1_000,
+      input_tokens_details: { cached_tokens: 250 },
+      output_tokens_details: { reasoning_tokens: 120 },
+    });
+  });
+
+  it('normalizes partial Responses usage without throwing', () => {
+    assert.equal(extractOpenAIUsage({}), null);
+    assert.deepEqual(extractOpenAIUsage({ usage: { input_tokens: 7 } }), {
+      input_tokens: 7,
+      output_tokens: 0,
+      total_tokens: 7,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      reasoning_tokens: 0,
+      raw_input_tokens: 7,
+      input_tokens_details: null,
+      output_tokens_details: null,
+    });
   });
 });

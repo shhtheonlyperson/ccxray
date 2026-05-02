@@ -231,6 +231,45 @@ describe('store', () => {
       const r = store.detectSession(bareSubagentReq());
       assert.equal(r.sessionId, 'aaa-111');
     });
+
+    it('uses a stable provider-scoped fallback session for Codex traffic', () => {
+      const store = require('../server/store');
+      resetSessionState(store);
+
+      const codexReq = {
+        model: 'gpt-5.1-codex',
+        input: 'hello',
+      };
+      const r1 = store.detectSession(codexReq, { provider: 'openai', cwdFallback: '/tmp/codex-project' });
+      const r2 = store.detectSession(codexReq, { provider: 'openai', cwdFallback: '/tmp/codex-project' });
+
+      assert.match(r1.sessionId, /^codex-[a-f0-9]{12}$/);
+      assert.equal(r2.sessionId, r1.sessionId);
+      assert.equal(r1.isNewSession, true);
+      assert.equal(r2.isNewSession, false);
+      assert.equal(store.sessionMeta[r1.sessionId].provider, 'openai');
+    });
+
+    it('extracts Codex cwd from request context and leaves Claude fallback isolated', () => {
+      const store = require('../server/store');
+      resetSessionState(store);
+
+      const cwd = store.extractCwdForProvider({
+        instructions: 'You are Codex.',
+        input: [{
+          role: 'user',
+          content: [{ type: 'input_text', text: '<environment_context>\n<cwd>/Users/shh/proj/ccxray</cwd>\n</environment_context>' }],
+        }],
+      }, 'openai');
+
+      assert.equal(cwd, '/Users/shh/proj/ccxray');
+
+      const codex = store.detectSession({ model: 'gpt-5.1-codex', input: 'hi' }, { provider: 'openai', cwdFallback: '/tmp/codex' });
+      assert.match(codex.sessionId, /^codex-/);
+
+      const claude = store.detectSession({ messages: [{ role: 'user', content: 'hi' }] }, { provider: 'anthropic' });
+      assert.notEqual(claude.sessionId, codex.sessionId);
+    });
   });
 
   describe('entry memory release', () => {

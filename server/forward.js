@@ -106,8 +106,207 @@ function applyModelPrefix(parsedBody, prefix) {
   return true;
 }
 
-// Tunnel agent is module-level so the connection pool is reused across requests.
-const TUNNEL_AGENT = resolveProxyAgent(config.ANTHROPIC_PROTOCOL, process.env);
+function extractOpenAIUsage(resData) {
+  const u = resData?.usage;
+  if (!u || typeof u !== 'object') return null;
+  const inputDetails = u.input_tokens_details || u.prompt_tokens_details || null;
+  const outputDetails = u.output_tokens_details || u.completion_tokens_details || null;
+  const rawInputTokens = Number(u.input_tokens ?? u.prompt_tokens ?? 0) || 0;
+  const cachedInputTokens = Number(inputDetails?.cached_tokens || 0) || 0;
+  const outputTokens = Number(u.output_tokens ?? u.completion_tokens ?? 0) || 0;
+  const reasoningTokens = Number(outputDetails?.reasoning_tokens || 0) || 0;
+  const totalTokens = u.total_tokens ?? (rawInputTokens + outputTokens);
+  return {
+    input_tokens: Math.max(0, rawInputTokens - cachedInputTokens),
+    output_tokens: outputTokens,
+    total_tokens: Number(totalTokens) || 0,
+    cache_creation_input_tokens: 0,
+    cache_read_input_tokens: cachedInputTokens,
+    reasoning_tokens: reasoningTokens,
+    raw_input_tokens: rawInputTokens,
+    input_tokens_details: inputDetails,
+    output_tokens_details: outputDetails,
+  };
+}
+
+function addSessionCost(sessionId, costInfo) {
+  if (!sessionId || costInfo?.cost == null) return;
+  store.sessionCosts.set(sessionId, (store.sessionCosts.get(sessionId) || 0) + costInfo.cost);
+}
+
+function parseSSEFrame(rawFrame, receivedAt) {
+  const frame = {
+    event: null,
+    type: null,
+    data: null,
+  };
+  if (receivedAt) frame._ts = receivedAt;
+
+  const dataLines = [];
+  for (const rawLine of String(rawFrame || '').split(/\n/)) {
+    const line = rawLine.endsWith('\r') ? rawLine.slice(0, -1) : rawLine;
+    if (!line || line.startsWith(':')) continue;
+    const sep = line.indexOf(':');
+    const field = sep >= 0 ? line.slice(0, sep) : line;
+    let value = sep >= 0 ? line.slice(sep + 1) : '';
+    if (value.startsWith(' ')) value = value.slice(1);
+
+    if (field === 'event') frame.event = value || null;
+    else if (field === 'data') dataLines.push(value);
+    else if (field === 'id') frame.id = value;
+    else if (field === 'retry') frame.retry = value;
+  }
+
+  const dataText = dataLines.join('\n');
+  if (!dataText) {
+    frame.type = frame.event || 'raw';
+    frame.raw = rawFrame;
+    return frame;
+  }
+  if (dataText === '[DONE]') {
+    frame.type = frame.event || 'done';
+    frame.data = '[DONE]';
+    return frame;
+  }
+
+  try {
+    const parsed = JSON.parse(dataText);
+    frame.data = parsed;
+    frame.type = parsed?.type || frame.event || null;
+  } catch {
+    frame.type = frame.event || 'raw';
+    frame.dataRaw = dataText;
+    frame.raw = rawFrame;
+    frame.parseError = true;
+  }
+
+  return frame;
+}
+
+function getOpenAIEventData(event) {
+  return event?.data && typeof event.data === 'object' ? event.data : null;
+}
+
+function extractOpenAICompletedResponse(events) {
+  if (!Array.isArray(events)) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const evt = events[i];
+    const data = getOpenAIEventData(evt);
+    if (!data) continue;
+    if ((evt.event === 'response.completed' || data.type === 'response.completed') && data.response) {
+      return data.response;
+    }
+  }
+  return null;
+}
+
+function extractOpenAIStreamUsage(events) {
+  const completed = extractOpenAICompletedResponse(events);
+  if (completed?.usage) return extractOpenAIUsage(completed);
+
+  if (!Array.isArray(events)) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const data = getOpenAIEventData(events[i]);
+    if (data?.usage) return extractOpenAIUsage(data);
+  }
+  return null;
+}
+
+function collectOpenAIStreamText(events) {
+  if (!Array.isArray(events)) return '';
+  let out = '';
+  for (const evt of events) {
+    const data = getOpenAIEventData(evt);
+    if (!data) continue;
+    const eventName = evt.event || data.type;
+    if (eventName === 'response.output_text.delta' && typeof data.delta === 'string') {
+      out += data.delta;
+    }
+  }
+  if (out) return out;
+
+  const completed = extractOpenAICompletedResponse(events);
+  if (!Array.isArray(completed?.output)) return '';
+  const parts = [];
+  for (const item of completed.output) {
+    if (!Array.isArray(item?.content)) continue;
+    for (const content of item.content) {
+      if ((content.type === 'output_text' || content.type === 'text') && typeof content.text === 'string') {
+        parts.push(content.text);
+      }
+    }
+  }
+  return parts.join('');
+}
+
+function extractOpenAIStreamTitle(events) {
+  const text = collectOpenAIStreamText(events).trim().replace(/\s+/g, ' ');
+  if (!text) return null;
+  const firstSentence = text.split(/[.\n]/)[0].trim();
+  return (firstSentence || text).slice(0, 80) || null;
+}
+
+function extractOpenAIStreamOutputItems(events) {
+  const completed = extractOpenAICompletedResponse(events);
+  if (Array.isArray(completed?.output)) return completed.output;
+
+  if (!Array.isArray(events)) return [];
+  const items = [];
+  const byIndex = new Map();
+  for (const evt of events) {
+    const data = getOpenAIEventData(evt);
+    if (!data) continue;
+    const eventName = evt.event || data.type;
+    const item = data.item || data.output_item;
+    if ((eventName === 'response.output_item.added' || eventName === 'response.output_item.done') && item) {
+      if (data.output_index != null) byIndex.set(data.output_index, item);
+      else items.push(item);
+    }
+  }
+  if (byIndex.size) {
+    return [...byIndex.entries()].sort((a, b) => a[0] - b[0]).map(([, item]) => item);
+  }
+  return items;
+}
+
+function buildResponseMetadata(provider, resData, proxyRes) {
+  if (provider === 'openai' && resData && typeof resData === 'object') {
+    return {
+      provider: 'openai',
+      id: resData.id || null,
+      object: resData.object || null,
+      model: resData.model || null,
+      status: proxyRes.statusCode,
+    };
+  }
+  return {
+    provider: provider || 'anthropic',
+    status: proxyRes.statusCode,
+  };
+}
+
+function getEntryProvider(ctx) {
+  return ctx.upstream?.provider || 'anthropic';
+}
+
+function getEntryAgent(provider) {
+  return provider === 'openai' ? 'codex' : 'claude';
+}
+
+function isProviderSubagent(provider, parsedBody) {
+  return provider === 'anthropic' && !store.extractCwd(parsedBody);
+}
+
+// Tunnel agents are module-level so connection pools are reused across requests.
+const TUNNEL_AGENTS = new Map();
+function getTunnelAgent(upstream) {
+  if (!upstream || upstream.protocol !== 'https') return null;
+  const key = upstream.provider || `${upstream.protocol}:${upstream.host}:${upstream.port}`;
+  if (!TUNNEL_AGENTS.has(key)) {
+    TUNNEL_AGENTS.set(key, resolveProxyAgent(upstream.protocol, process.env));
+  }
+  return TUNNEL_AGENTS.get(key);
+}
 
 // ── Strip injected proxy stats from conversation history ─────────────
 const STATS_PATTERN = /\n\n---\n📊 Context: .+$/s;
@@ -133,14 +332,16 @@ function stripInjectedStats(parsedBody) {
 // ── Forward request to Anthropic ─────────────────────────────────────
 function forwardRequest(ctx) {
   const { id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId } = ctx;
+  const upstream = ctx.upstream || config.getUpstreamForRequest(clientReq.url);
 
   // Counter + attribution prefix are committed here, not at request receipt.
   // This guarantees intercepted-then-rejected requests never advance the
   // per-session sequence number that the dashboard's displayNum mirrors.
   // Counter classification uses !extractCwd to match dashboard's isSubagent.
   if (!ctx.skipEntry && parsedBody) {
+    const provider = getEntryProvider(ctx);
     const meta = reqSessionId ? (store.sessionMeta[reqSessionId] || (store.sessionMeta[reqSessionId] = {})) : null;
-    const isSubagent = !store.extractCwd(parsedBody);
+    const isSubagent = isProviderSubagent(provider, parsedBody);
     if (meta) {
       if (isSubagent) meta.subCount = (meta.subCount || 0) + 1;
       else meta.mainCount = (meta.mainCount || 0) + 1;
@@ -153,7 +354,9 @@ function forwardRequest(ctx) {
       cwdForPrefix = hub.lookupClientCwd();
     }
     const isOrphan = isSubagent && ctx.sessionInferred && !cwdForPrefix && (!reqSessionId || reqSessionId === 'direct-api');
-    const turnStep = helpers.computeTurnStep(parsedBody.messages);
+    const turnStep = provider === 'anthropic'
+      ? helpers.computeTurnStep(parsedBody.messages)
+      : { turn: 0, step: 0 };
     ctx.attribPrefix = helpers.renderAttributionPrefix({
       sessionId: reqSessionId,
       cwd: cwdForPrefix,
@@ -175,12 +378,13 @@ function forwardRequest(ctx) {
   const modelPrefixed = applyModelPrefix(parsedBody, config.REWRITE_MODEL_PREFIX);
   const bodyToSend = (ctx.bodyModified || statsStripped || modelPrefixed) ? Buffer.from(JSON.stringify(parsedBody)) : rawBody;
 
-  const transport = config.ANTHROPIC_PROTOCOL === 'http' ? http : https;
+  const transport = upstream.protocol === 'http' ? http : https;
+  const tunnelAgent = getTunnelAgent(upstream);
   const proxyReq = transport.request({
-    hostname: config.ANTHROPIC_HOST, port: config.ANTHROPIC_PORT,
-    path: config.ANTHROPIC_BASE_PATH + clientReq.url, method: clientReq.method,
+    hostname: upstream.host, port: upstream.port,
+    path: config.joinUpstreamPath(upstream, clientReq.url), method: clientReq.method,
     headers: { ...fwdHeaders, 'content-length': bodyToSend.length },
-    ...(TUNNEL_AGENT ? { agent: TUNNEL_AGENT } : {}),
+    ...(tunnelAgent ? { agent: tunnelAgent } : {}),
   }, (proxyRes) => {
     const isSSE = (proxyRes.headers['content-type'] || '').includes('text/event-stream');
 
@@ -206,7 +410,8 @@ function forwardRequest(ctx) {
   });
 
   proxyReq.on('error', (err) => {
-    console.error(`\x1b[31m❌ PROXY ERROR: ${err.message || err.code || String(err)}\x1b[0m`);
+    const errorMessage = err.message || err.code || String(err);
+    console.error(`\x1b[31m❌ PROXY ERROR: ${errorMessage}\x1b[0m`);
     if (reqSessionId) {
       store.activeRequests[reqSessionId] = Math.max(0, (store.activeRequests[reqSessionId] || 1) - 1);
       broadcastSessionStatus(reqSessionId);
@@ -214,13 +419,19 @@ function forwardRequest(ctx) {
     if (!clientRes.headersSent) {
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
     }
-    clientRes.end(JSON.stringify({ error: 'proxy_error', message: err.message }));
+    clientRes.end(JSON.stringify({ error: 'proxy_error', message: errorMessage }));
   });
 
   proxyReq.end(bodyToSend);
 }
 
 function handleSSEResponse(ctx, proxyRes, clientRes) {
+  const provider = ctx.upstream?.provider || 'anthropic';
+  if (provider === 'openai') {
+    handleOpenAISSE(ctx, proxyRes, clientRes);
+    return;
+  }
+
   const { id, startTime, parsedBody, reqSessionId, fwdHeaders } = ctx;
   const resChunks = [];
   let sseLineBuf = '';
@@ -400,6 +611,8 @@ function handleSSEResponse(ctx, proxyRes, clientRes) {
     const thinkingStripped = computeThinkingStripped(isSubagent, reqSessionId, currMsgCount, parsedBody);
     const entry = {
       id, ts: ctx.ts, sessionId, method: ctx.clientReq.method, url: ctx.clientReq.url,
+      provider: 'anthropic',
+      agent: 'claude',
       req: parsedBody, res: events,
       elapsed, status: proxyRes.statusCode, isSSE: true,
       tokens: helpers.tokenizeRequest(parsedBody),
@@ -434,6 +647,8 @@ function handleSSEResponse(ctx, proxyRes, clientRes) {
     // Persist to index (fire-and-forget after broadcast)
     const indexLine = JSON.stringify({
       id, ts: ctx.ts, sessionId,
+      provider: entry.provider,
+      agent: entry.agent,
       model: entry.model, msgCount: entry.msgCount, toolCount: entry.toolCount,
       toolCalls: entry.toolCalls, isSubagent: entry.isSubagent, sessionInferred: entry.sessionInferred,
       cwd: entry.cwd, isSSE: true,
@@ -467,6 +682,151 @@ function handleSSEResponse(ctx, proxyRes, clientRes) {
     if (costInfo?.cost != null) {
       store.sessionCosts.set(sessionId, (store.sessionCosts.get(sessionId) || 0) + costInfo.cost);
       console.log(`  💰 $${costInfo.cost.toFixed(4)} this turn | $${store.sessionCosts.get(sessionId).toFixed(4)} session`);
+    }
+    helpers.printSeparator();
+    console.log();
+  });
+}
+
+function handleOpenAISSE(ctx, proxyRes, clientRes) {
+  const { id, startTime, parsedBody, reqSessionId } = ctx;
+  const events = [];
+  let sseBuf = '';
+
+  const processFrames = (text, flush = false) => {
+    sseBuf += text.replace(/\r\n/g, '\n');
+    const parts = sseBuf.split('\n\n');
+    sseBuf = parts.pop();
+    for (const part of parts) {
+      if (!part.trim()) continue;
+      events.push(parseSSEFrame(part, Date.now()));
+    }
+    if (flush && sseBuf.trim()) {
+      events.push(parseSSEFrame(sseBuf, Date.now()));
+      sseBuf = '';
+    }
+  };
+
+  proxyRes.on('error', (err) => {
+    console.error(`\x1b[31m❌ UPSTREAM STREAM ERROR: ${err.message}\x1b[0m`);
+    if (reqSessionId) {
+      store.activeRequests[reqSessionId] = Math.max(0, (store.activeRequests[reqSessionId] || 1) - 1);
+      broadcastSessionStatus(reqSessionId);
+    }
+    if (!clientRes.writableEnded) clientRes.end();
+  });
+
+  proxyRes.on('data', chunk => {
+    processFrames(chunk.toString('utf8'));
+    clientRes.write(chunk);
+  });
+
+  proxyRes.on('end', () => {
+    processFrames('', true);
+    clientRes.end();
+
+    if (ctx.skipEntry) return;
+
+    if (reqSessionId) {
+      store.activeRequests[reqSessionId] = Math.max(0, (store.activeRequests[reqSessionId] || 1) - 1);
+      broadcastSessionStatus(reqSessionId);
+    }
+
+    const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+    const completedResponse = extractOpenAICompletedResponse(events);
+    const responseUsage = extractOpenAIStreamUsage(events);
+    const responseModel = completedResponse?.model || parsedBody?.model || null;
+    const costInfo = responseUsage ? calculateCost(responseUsage, responseModel) : null;
+    const responseMetadata = buildResponseMetadata('openai', completedResponse || {}, proxyRes);
+    responseMetadata.streaming = true;
+    responseMetadata.outputItems = extractOpenAIStreamOutputItems(events);
+    if (completedResponse?.status) responseMetadata.responseStatus = completedResponse.status;
+
+    const resWritePromise = config.storage.write(id, '_res.json', JSON.stringify(events))
+      .catch(e => console.error('Write res.json failed:', e.message));
+
+    const sessionId = reqSessionId;
+    const maxContext = config.getMaxContext(parsedBody?.model, parsedBody?.system);
+    const isSubagent = isProviderSubagent('openai', parsedBody);
+    const title = extractOpenAIStreamTitle(events)
+      || helpers.extractLastUserText(parsedBody)
+      || null;
+    const stopReason = completedResponse?.status || '';
+    const currMsgCount = parsedBody?.messages?.length || 0;
+    const thinkingStripped = computeThinkingStripped(isSubagent, reqSessionId, currMsgCount, parsedBody);
+    const entry = {
+      id, ts: ctx.ts, sessionId, method: ctx.clientReq.method, url: ctx.clientReq.url,
+      provider: 'openai',
+      agent: 'codex',
+      req: parsedBody, res: events,
+      elapsed, status: proxyRes.statusCode, isSSE: true,
+      tokens: helpers.tokenizeRequest(parsedBody),
+      usage: responseUsage, cost: costInfo,
+      responseMetadata,
+      maxContext,
+      cwd: store.sessionMeta[sessionId]?.cwd || null,
+      receivedAt: startTime,
+      thinkingDuration: null,
+      duplicateToolCalls: helpers.extractDuplicateToolCalls(parsedBody?.messages),
+      model: responseModel,
+      msgCount: currMsgCount,
+      toolCount: parsedBody?.tools?.length || 0,
+      toolCalls: helpers.extractToolCalls(parsedBody?.messages),
+      isSubagent,
+      sessionInferred: ctx.sessionInferred || false,
+      title,
+      stopReason,
+      toolFail: helpers.hasToolFail(parsedBody),
+      sysHash: ctx.sysHash || null,
+      toolsHash: ctx.toolsHash || null,
+      coreHash: ctx.coreHash || null,
+      thinkingStripped,
+    };
+    entry.hasCredential = helpers.entryHasCredential(entry) || undefined;
+    entry.toolSources = helpers.buildToolSources(entry) || undefined;
+    entry._writePromise = Promise.all([ctx.reqWritePromise, resWritePromise].filter(Boolean));
+    store.entries.push(entry);
+    store.trimEntries();
+    broadcast(entry);
+
+    const indexLine = JSON.stringify({
+      id, ts: ctx.ts, sessionId,
+      provider: entry.provider,
+      agent: entry.agent,
+      model: entry.model, msgCount: entry.msgCount, toolCount: entry.toolCount,
+      toolCalls: entry.toolCalls, isSubagent: entry.isSubagent, sessionInferred: entry.sessionInferred,
+      cwd: entry.cwd, isSSE: true,
+      usage: entry.usage, cost: costInfo, maxContext,
+      responseMetadata,
+      stopReason, title, thinkingDuration: null,
+      toolFail: entry.toolFail,
+      elapsed, status: proxyRes.statusCode,
+      receivedAt: startTime,
+      sysHash: ctx.sysHash || null, toolsHash: ctx.toolsHash || null,
+      coreHash: entry.coreHash,
+      thinkingStripped: entry.thinkingStripped,
+      hasCredential: entry.hasCredential,
+      toolSources: entry.toolSources,
+    });
+    config.storage.appendIndex(indexLine + '\n').catch(e => console.error('Write index failed:', e.message));
+
+    entry.req = null;
+    entry.res = null;
+    entry._loaded = false;
+
+    const code = proxyRes.statusCode;
+    const ok = code >= 200 && code < 300;
+    const glyph = ok ? '✓' : '✗';
+    const color = ok ? '\x1b[32m' : '\x1b[31m';
+    const outTok = responseUsage?.output_tokens ? `  out=${responseUsage.output_tokens.toLocaleString()} tok` : '';
+    const prefix = ctx.attribPrefix || '';
+    console.log(`${color}📥 [${helpers.taipeiTime()}]  ${prefix}  ${glyph} ${code}  ${elapsed}s${outTok}\x1b[0m`);
+    if (responseUsage) helpers.printContextBar(responseUsage, responseModel, parsedBody?.system);
+    if (costInfo?.cost != null) {
+      addSessionCost(sessionId, costInfo);
+      console.log(`  💰 $${costInfo.cost.toFixed(4)} this turn | $${store.sessionCosts.get(sessionId).toFixed(4)} session`);
+    } else if (costInfo?.warning) {
+      console.log(`  💰 cost unavailable (${costInfo.warning})`);
     }
     helpers.printSeparator();
     console.log();
@@ -511,7 +871,12 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
 
     const sessionId = reqSessionId;
     const maxContext = config.getMaxContext(parsedBody?.model, parsedBody?.system);
-    const isSubagent = !store.extractCwd(parsedBody);
+    const provider = getEntryProvider(ctx);
+    const isSubagent = isProviderSubagent(provider, parsedBody);
+    const responseMetadata = buildResponseMetadata(provider, resData, proxyRes);
+    const responseUsage = provider === 'openai' ? extractOpenAIUsage(resData) : null;
+    const responseModel = provider === 'openai' ? (resData?.model || parsedBody?.model || null) : (parsedBody?.model || null);
+    const costInfo = responseUsage ? calculateCost(responseUsage, responseModel) : null;
     const titleGenTitle = resolveTitleGenTitle(parsedBody, resData, startTime);
     const title = titleGenTitle
       || (isSubagent
@@ -526,15 +891,18 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
     const thinkingStripped = computeThinkingStripped(isSubagent, reqSessionId, currMsgCount, parsedBody);
     const entry = {
       id, ts: ctx.ts, sessionId, method: ctx.clientReq.method, url: ctx.clientReq.url,
+      provider,
+      agent: getEntryAgent(provider),
       req: parsedBody, res: resData,
       elapsed, status: proxyRes.statusCode, isSSE: false,
       tokens: helpers.tokenizeRequest(parsedBody),
-      usage: null, cost: null,
+      usage: responseUsage, cost: costInfo,
+      responseMetadata,
       maxContext,
       cwd: store.sessionMeta[sessionId]?.cwd || null,
       receivedAt: startTime,
       duplicateToolCalls: helpers.extractDuplicateToolCalls(parsedBody?.messages),
-      model: parsedBody?.model || null,
+      model: responseModel,
       msgCount: currMsgCount,
       toolCount: parsedBody?.tools?.length || 0,
       toolCalls: helpers.extractToolCalls(parsedBody?.messages),
@@ -557,10 +925,13 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
 
     const indexLine = JSON.stringify({
       id, ts: ctx.ts, sessionId,
+      provider: entry.provider,
+      agent: entry.agent,
       model: entry.model, msgCount: entry.msgCount, toolCount: entry.toolCount,
       toolCalls: entry.toolCalls, isSubagent: entry.isSubagent, sessionInferred: entry.sessionInferred,
       cwd: entry.cwd, isSSE: false,
-      usage: null, cost: null, maxContext,
+      usage: entry.usage, cost: costInfo, maxContext,
+      responseMetadata,
       stopReason, title, thinkingDuration: null,
       toolFail,
       elapsed, status: proxyRes.statusCode,
@@ -589,9 +960,28 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
     }
     const prefix2 = ctx.attribPrefix || '';
     console.log(`${color2}📥 [${helpers.taipeiTime()}]  ${prefix2}  ${glyph2} ${code2}  ${elapsed}s${errTag}\x1b[0m`);
+    if (responseUsage) helpers.printContextBar(responseUsage, responseModel, parsedBody?.system);
+    if (costInfo?.cost != null) {
+      addSessionCost(sessionId, costInfo);
+      console.log(`  💰 $${costInfo.cost.toFixed(4)} this turn | $${store.sessionCosts.get(sessionId).toFixed(4)} session`);
+    } else if (costInfo?.warning) {
+      console.log(`  💰 cost unavailable (${costInfo.warning})`);
+    }
     helpers.printSeparator();
     console.log();
   });
 }
 
-module.exports = { forwardRequest, resolveProxyAgent, applyModelPrefix, stripInjectedStats, setStatusLineEnabled, getStatusLineEnabled };
+module.exports = {
+  forwardRequest,
+  resolveProxyAgent,
+  applyModelPrefix,
+  stripInjectedStats,
+  setStatusLineEnabled,
+  getStatusLineEnabled,
+  parseSSEFrame,
+  extractOpenAIUsage,
+  extractOpenAIStreamUsage,
+  extractOpenAICompletedResponse,
+  collectOpenAIStreamText,
+};
