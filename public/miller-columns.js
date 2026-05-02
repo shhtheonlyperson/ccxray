@@ -713,6 +713,66 @@ function renderCodexTools(tools) {
     '<details style="margin-top:8px" open><summary style="color:var(--dim);cursor:pointer;font-size:11px">Full definitions</summary><pre>' + escapeHtml(JSON.stringify(tools, null, 2)) + '</pre></details>';
 }
 
+function isGeminiConnectEntry(entry, req) {
+  return getEntryProvider(entry) === 'google' && req?.method === 'CONNECT';
+}
+
+function renderGeminiConnectContext(entry, req, res, section) {
+  const target = req.target || entry.url || 'unknown target';
+  const status = [res?.status || entry.status || null, res?.statusText || null].filter(Boolean).join(' ') || 'unknown';
+  const headers = req.headers && typeof req.headers === 'object' ? req.headers : {};
+  const headerKeys = Object.keys(headers).sort();
+  const sectionCopy = {
+    system: {
+      title: 'Gemini CONNECT Boundary',
+      rows: [
+        ['Context section', 'System'],
+        ['Capture mode', 'HTTPS CONNECT tunnel'],
+        ['Decoded system prompt', 'Not available in CONNECT mode'],
+        ['Reason', 'Gemini payload remains TLS-encrypted inside the tunnel'],
+      ],
+    },
+    core: {
+      title: 'Gemini Core Visibility',
+      rows: [
+        ['Context section', 'Core tools'],
+        ['Decoded core tools', 'Not available in CONNECT mode'],
+        ['Captured instead', 'Tunnel target, status, and sanitized CONNECT headers'],
+        ['Next capture path', 'Gemini-specific plaintext adapter'],
+      ],
+    },
+    mcp: {
+      title: 'Gemini MCP Visibility',
+      rows: [
+        ['Context section', 'MCP tools'],
+        ['Decoded MCP tools', 'Not available in CONNECT mode'],
+        ['Captured instead', 'Tunnel target, status, and sanitized CONNECT headers'],
+        ['Next capture path', 'Gemini-specific plaintext adapter'],
+      ],
+    },
+  };
+  const copy = sectionCopy[section] || sectionCopy.system;
+  const rows = [
+    ...copy.rows,
+    ['Target', target],
+    ['Tunnel status', status],
+    ['Header fields', headerKeys.length ? headerKeys.join(', ') : 'none'],
+  ];
+  const rowHtml = rows.map(([k, v]) =>
+    '<div style="display:grid;grid-template-columns:160px 1fr;gap:10px;padding:5px 0;border-bottom:1px solid var(--border)">'
+    + '<div style="color:var(--dim)">' + escapeHtml(String(k)) + '</div>'
+    + '<div>' + escapeHtml(String(v)) + '</div>'
+    + '</div>'
+  ).join('');
+  return '<div class="detail-content">'
+    + '<div style="font-size:12px;font-weight:700;margin-bottom:8px">' + escapeHtml(copy.title) + '</div>'
+    + '<div style="font-size:11px;line-height:1.5;margin-bottom:12px">' + rowHtml + '</div>'
+    + '<details open><summary style="color:var(--dim);cursor:pointer;font-size:11px">Captured CONNECT request</summary><pre>'
+    + escapeHtml(JSON.stringify(req, null, 2))
+    + '</pre></details>'
+    + '</div>';
+}
+
 function codexInputText(item) {
   if (typeof item === 'string') return item;
   if (!item || typeof item !== 'object') return '';
@@ -1291,6 +1351,7 @@ function renderSectionsCol(idx) {
 
   const coreTools = req.tools ? req.tools.filter(t => !isMcpTool(t)) : null;
   const mcpTools  = req.tools ? req.tools.filter(t =>  isMcpTool(t)) : null;
+  const isGeminiConnect = isGeminiConnectEntry(e, req);
   const tc = allEntries[idx]?.toolCalls || {};
   const coreCalls = Object.entries(tc).filter(([n]) => !n.startsWith('mcp__')).reduce((s, [, c]) => s + c, 0);
   const mcpCalls  = Object.entries(tc).filter(([n]) =>  n.startsWith('mcp__')).reduce((s, [, c]) => s + c, 0);
@@ -1344,9 +1405,9 @@ function renderSectionsCol(idx) {
     html += renderSectionItem({ name: 'codex-tools', label: 'Tools', color: 'var(--color-tools)', badge: req.tools ? req.tools.length + ' tools' : (e.reqLoaded ? '' : '…') });
   } else {
     const contextSections = [
-      { name: 'system',     label: 'System',     color: 'var(--color-system)', badge: tok.system ? fmt(tok.system) + ' tok' : (req.system ? '' : (e.reqLoaded ? '' : '…')), subline: sysSubline },
-      { name: 'core-tools', label: 'Core',        color: 'var(--color-tools)', badge: coreTools ? coreTools.length + ' tools' + (coreCalls ? ' · ' + coreCalls + '×' : '') : (e.reqLoaded ? '' : '…') },
-      { name: 'mcp-tools',  label: 'MCP',         color: 'var(--color-mcp-tools)', badge: mcpTools  ? mcpTools.length  + ' tools' + (mcpCalls  ? ' · ' + mcpCalls  + '×' : '') : (e.reqLoaded ? '' : '…') },
+      { name: 'system',     label: 'System',     color: 'var(--color-system)', badge: isGeminiConnect ? 'tunnel' : (tok.system ? fmt(tok.system) + ' tok' : (req.system ? '' : (e.reqLoaded ? '' : '…'))), subline: sysSubline },
+      { name: 'core-tools', label: 'Core',        color: 'var(--color-tools)', badge: isGeminiConnect ? 'encrypted' : (coreTools ? coreTools.length + ' tools' + (coreCalls ? ' · ' + coreCalls + '×' : '') : (e.reqLoaded ? '' : '…')) },
+      { name: 'mcp-tools',  label: 'MCP',         color: 'var(--color-mcp-tools)', badge: isGeminiConnect ? 'encrypted' : (mcpTools  ? mcpTools.length  + ' tools' + (mcpCalls  ? ' · ' + mcpCalls  + '×' : '') : (e.reqLoaded ? '' : '…')) },
     ];
     for (const s of contextSections) { html += renderSectionItem(s); }
   }
@@ -1586,6 +1647,8 @@ function renderDetailCol() {
         inner = '<div class="detail-content"><pre>' + escapeHtml(
           typeof req.instructions === 'string' ? req.instructions : JSON.stringify(req.instructions, null, 2)
         ) + '</pre></div>';
+      } else if (isGeminiConnectEntry(e, req)) {
+        inner = renderGeminiConnectContext(e, req, e.res, 'system');
       } else if (req.system) {
         inner = '<div class="detail-content">' + renderSystemBlockViewer(req.system) + '</div>';
       } else { inner = e.reqLoaded ? '<div class="col-empty">No instructions</div>' : loading; }
@@ -1695,6 +1758,8 @@ function renderDetailCol() {
         }).join('');
         inner = '<div class="detail-content"><div class="tool-grid">' + tags + '</div>' +
           '<details style="margin-top:8px"><summary style="color:var(--dim);cursor:pointer;font-size:11px">Full definitions</summary><pre>' + escapeHtml(JSON.stringify(filtered, null, 2)) + '</pre></details></div>';
+      } else if (isGeminiConnectEntry(e, req)) {
+        inner = renderGeminiConnectContext(e, req, e.res, isMcp ? 'mcp' : 'core');
       } else { inner = e.reqLoaded ? '<div class="col-empty">No ' + (isMcp ? 'MCP' : 'core') + ' tools</div>' : loading; }
       break;
     }

@@ -321,6 +321,84 @@ describe('standard proxy tunnel', () => {
     assert.match(fullEntry.res.note, /not captured/);
   });
 
+  it('renders Gemini CONNECT context detail panels in the dashboard', async () => {
+    await new Promise((resolve, reject) => {
+      const client = net.connect(proxyPort, '127.0.0.1');
+      let data = '';
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error('CONNECT dashboard setup timed out'));
+      }, 3000);
+
+      client.on('connect', () => {
+        client.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\nUser-Agent: gemini-ui-test\r\n\r\n`);
+      });
+      client.on('data', chunk => {
+        data += chunk.toString('utf8');
+        if (data.includes('\r\n\r\n')) {
+          clearTimeout(timer);
+          client.end();
+          resolve();
+        }
+      });
+      client.on('error', err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    const { entries } = await httpGet(proxyPort, '/_api/entries');
+    const tunnelEntry = entries
+      .filter(entry => entry.provider === 'google' && entry.url === `127.0.0.1:${targetPort}`)
+      .at(-1);
+    assert.ok(tunnelEntry, 'CONNECT tunnel should be available before opening dashboard');
+
+    const puppeteer = require('puppeteer');
+    const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+    try {
+      const page = await browser.newPage();
+      page.setDefaultTimeout(10000);
+      await page.goto(`http://127.0.0.1:${proxyPort}/`, { waitUntil: 'domcontentloaded' });
+
+      await page.waitForFunction(entryId => (
+        typeof allEntries !== 'undefined'
+        && allEntries.some(e => e.id === entryId)
+      ), {}, tunnelEntry.id);
+
+      await page.evaluate(entryId => {
+        const idx = allEntries.map((e, i) => ({ e, i }))
+          .find(({ e }) => e.id === entryId).i;
+        const entry = allEntries[idx];
+        selectProject(getProjectName(entry.cwd));
+        selectSessionAndLatestTurn(entry.sessionId);
+        selectTurn(idx);
+      }, tunnelEntry.id);
+
+      await page.waitForFunction(entryId => {
+        const match = allEntries.find(e => e.id === entryId);
+        return Boolean(match?.reqLoaded);
+      }, {}, tunnelEntry.id);
+
+      const assertions = [
+        ['system', 'Decoded system prompt'],
+        ['core-tools', 'Decoded core tools'],
+        ['mcp-tools', 'Decoded MCP tools'],
+      ];
+      for (const [section, expected] of assertions) {
+        await page.evaluate(name => selectSection(name), section);
+        await page.waitForFunction(text => (
+          document.getElementById('col-detail')?.innerText.includes(text)
+        ), {}, expected);
+        const detailText = await page.$eval('#col-detail', el => el.innerText);
+        assert.match(detailText, /Gemini/);
+        assert.match(detailText, /TLS-encrypted|CONNECT mode|sanitized CONNECT headers/);
+        assert.match(detailText, new RegExp(String(targetPort)));
+      }
+    } finally {
+      await browser.close();
+    }
+  });
+
   it('rejects malformed CONNECT targets', async () => {
     const response = await new Promise((resolve, reject) => {
       const client = net.connect(proxyPort, '127.0.0.1');
