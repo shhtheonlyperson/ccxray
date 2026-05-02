@@ -300,6 +300,10 @@ function buildMergedSteps(messages, resEvents) {
         } else if (ev.delta?.type === 'text_delta') {
           curText += ev.delta.text || '';
         }
+      } else if (ev.type === 'response.output_text.delta') {
+        curText += ev.delta || ev.data?.delta || '';
+      } else if (ev.type === 'response.output_text.done' && !curText) {
+        curText += ev.text || ev.data?.text || '';
       } else if (ev.type === 'content_block_stop') {
         if (curThinkingStart && !curThinkingEnd) curThinkingEnd = ev._ts || null;
       }

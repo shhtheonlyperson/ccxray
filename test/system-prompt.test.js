@@ -4,6 +4,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   extractAgentType,
+  extractPromptAgentType,
   splitB2IntoBlocks,
   computeBlockDiff,
   computeUnifiedDiff,
@@ -128,6 +129,32 @@ describe('system-prompt', () => {
         console.warn = originalWarn;
         _resetUnknownAgentSeen();
       }
+    });
+  });
+
+  describe('extractPromptAgentType', () => {
+    it('classifies OpenAI Responses prompts as Codex without using Claude buckets', () => {
+      const result = extractPromptAgentType('openai', {
+        instructions: 'You are Codex.',
+        input: 'hello',
+        tools: [{ type: 'function', name: 'shell' }],
+      });
+      assert.deepEqual(result, { key: 'codex', label: 'Codex' });
+    });
+
+    it('returns unknown for empty OpenAI payloads', () => {
+      assert.deepEqual(extractPromptAgentType('openai', {}), { key: 'unknown', label: 'Unknown' });
+    });
+
+    it('preserves Claude-specific classification for Anthropic payloads', () => {
+      const result = extractPromptAgentType('anthropic', {
+        system: [
+          { text: 'billing' },
+          { text: 'identity' },
+          { text: 'You are an interactive agent that helps users' },
+        ],
+      });
+      assert.equal(result.key, 'orchestrator');
     });
   });
 

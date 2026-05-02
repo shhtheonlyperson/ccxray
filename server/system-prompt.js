@@ -68,6 +68,19 @@ function extractAgentType(sys) {
   return { key: 'agent', label: 'Agent' };
 }
 
+function extractPromptAgentType(provider, req) {
+  if (provider === 'openai') {
+    const hasCodexPrompt =
+      req?.instructions != null ||
+      req?.input != null ||
+      (Array.isArray(req?.tools) && req.tools.length > 0);
+    return hasCodexPrompt
+      ? { key: 'codex', label: 'Codex' }
+      : { key: 'unknown', label: 'Unknown' };
+  }
+  return extractAgentType(req?.system);
+}
+
 function splitB2IntoBlocks(b2) {
   const markerDefs = [
     { key: 'customSkills',   pattern: /# User'?s Current Configuration/ },
@@ -182,6 +195,7 @@ function computeUnifiedDiff(textA, textB, labelA, labelB) {
 module.exports = {
   BLOCK_OWNERS_SERVER,
   extractAgentType,
+  extractPromptAgentType,
   splitB2IntoBlocks,
   computeBlockDiff,
   computeUnifiedDiff,

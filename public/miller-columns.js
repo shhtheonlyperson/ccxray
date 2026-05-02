@@ -445,7 +445,9 @@ function renderSessionItem(sess, sid) {
   const shortSid = sid === 'direct-api' ? 'direct API' : sid.slice(0, 8);
   const tooltip = sid === 'direct-api' ? 'direct API' : sid;
   const shortModel = (sess.model || '?').replace('claude-', '').replace(/-[0-9]{8}$/, '');
-  const costStr = sess.totalCost > 0 ? '$' + sess.totalCost.toFixed(2) : '—';
+  const costStr = sess.totalCost > 0
+    ? ('$' + sess.totalCost.toFixed(2) + (sess.hasUnknownCost ? ' + ?' : ''))
+    : (sess.hasUnknownCost ? 'cost ?' : '—');
   const dateStr = sess.lastId ? formatRelativeTime(sess.lastId) : (sess.firstId ? formatEntryDate(sess.firstId) : escapeHtml(sess.firstTs || ''));
   const previewText = sess.lastAssistantText
     ? sess.lastAssistantText.slice(0, 60) + (sess.lastAssistantText.length > 60 ? '…' : '')
@@ -572,7 +574,7 @@ function renderProjectsCol() {
     html += '<div class="project-item' + (isSel ? ' selected' : '') + '" onclick="selectProject(' + JSON.stringify(proj.name).replace(/"/g, '&quot;') + ')">' +
       '<div class="pi-name"><span class="sdot ' + statusClass + '" title="' + escapeHtml(dotTitle) + '"></span><span class="pi-label">' + escapeHtml(truncateMiddle(proj.name, 20)) + '</span>' + pinBtn + '</div>' +
       '<div class="pi-meta">' + proj.sessionIds.size + ' sessions</div>' +
-      '<div class="pi-meta pi-cost">$' + proj.totalCost.toFixed(2) + '</div>' +
+      '<div class="pi-meta pi-cost">' + (proj.totalCost > 0 ? ('$' + proj.totalCost.toFixed(2) + (proj.hasUnknownCost ? ' + ?' : '')) : (proj.hasUnknownCost ? 'cost ?' : '—')) + '</div>' +
       (rangeStr ? '<div class="pi-range">' + escapeHtml(rangeStr) + '</div>' : '') +
       '</div>';
   }
@@ -667,6 +669,78 @@ function escapeHtml(s) {
 }
 
 function fmt(n) { return n != null ? n.toLocaleString() : '—'; }
+
+function getEntryProvider(entry) {
+  return entry?.provider || 'anthropic';
+}
+
+function getProviderLabel(entry) {
+  return getEntryProvider(entry) === 'openai' ? 'Codex/OpenAI' : 'Claude/Anthropic';
+}
+
+function getToolName(tool) {
+  return tool?.name || tool?.function?.name || tool?.type || 'tool';
+}
+
+function isMcpTool(tool) {
+  return getToolName(tool).startsWith('mcp__');
+}
+
+function renderCodexInput(input) {
+  if (typeof input === 'string') {
+    return '<pre>' + escapeHtml(input) + '</pre>';
+  }
+  if (Array.isArray(input)) {
+    let html = '<div style="font-size:11px;color:var(--dim);margin-bottom:8px">' + input.length + ' input item' + (input.length === 1 ? '' : 's') + '</div>';
+    for (let i = 0; i < input.length; i++) {
+      const item = input[i] || {};
+      const role = item.role || item.type || 'item';
+      html += '<div class="msg"><div class="msg-role ' + escapeHtml(String(role)) + '">[' + i + '] ' + escapeHtml(String(role)) + '</div><pre>' + escapeHtml(JSON.stringify(item, null, 2)) + '</pre></div>';
+    }
+    return html;
+  }
+  if (input == null) return '<div class="col-empty">No input</div>';
+  return '<pre>' + escapeHtml(JSON.stringify(input, null, 2)) + '</pre>';
+}
+
+function renderCodexTools(tools) {
+  if (!Array.isArray(tools) || !tools.length) return '<div class="col-empty">No tools</div>';
+  const tags = tools.map(t => '<span class="tool-tag">' + escapeHtml(getToolName(t)) + '</span>').join('');
+  return '<div class="tool-grid">' + tags + '</div>' +
+    '<details style="margin-top:8px" open><summary style="color:var(--dim);cursor:pointer;font-size:11px">Full definitions</summary><pre>' + escapeHtml(JSON.stringify(tools, null, 2)) + '</pre></details>';
+}
+
+function codexInputText(item) {
+  if (typeof item === 'string') return item;
+  if (!item || typeof item !== 'object') return '';
+  if (typeof item.content === 'string') return item.content;
+  if (typeof item.text === 'string') return item.text;
+  if (!Array.isArray(item.content)) return '';
+  return item.content.map(part => {
+    if (typeof part === 'string') return part;
+    if (!part || typeof part !== 'object') return '';
+    return part.text || part.input_text || part.output_text || '';
+  }).filter(Boolean).join('\n');
+}
+
+function getTimelineMessagesForEntry(entry, req) {
+  if (Array.isArray(req.messages)) return req.messages;
+  if (getEntryProvider(entry) !== 'openai') return [];
+  const input = req.input;
+  if (typeof input === 'string') {
+    return input.trim() ? [{ role: 'user', content: [{ type: 'text', text: input }] }] : [];
+  }
+  if (!Array.isArray(input)) return [];
+  return input.map(item => {
+    const role = item?.role || 'user';
+    const text = codexInputText(item);
+    return text ? { role, content: [{ type: 'text', text }] } : null;
+  }).filter(Boolean);
+}
+
+function getUsageNumber(usage, key) {
+  return usage && Number.isFinite(Number(usage[key])) ? Number(usage[key]) : null;
+}
 
 // ── Miller Columns: Selection ──
 let _hoverTimer = null;
@@ -1163,8 +1237,8 @@ function renderSectionsCol(idx) {
   const tok = e.tokens || {};
   const req = e.req || {};
   const usage = e.usage || {};
-  const inTok = usage.input_tokens || '?';
-  const outTok = usage.output_tokens || '?';
+  const inTok = getUsageNumber(usage, 'input_tokens');
+  const outTok = getUsageNumber(usage, 'output_tokens');
   const statusClass = e.status >= 200 && e.status < 300 ? 'status-ok' : 'status-err';
   const resEvents = Array.isArray(e.res) ? e.res : [];
   const stopReason = e.stopReason || (Array.isArray(resEvents) ? (resEvents.find(ev => ev.type === 'message_delta')?.delta?.stop_reason || '') : '');
@@ -1181,13 +1255,13 @@ function renderSectionsCol(idx) {
 
   let html = '<div class="col-header">';
   html += '<div class="ch-line1"><span style="color:var(--dim)">' + (isSubagent ? '' : '#') + escapeHtml(displayNum) + '</span> <span style="color:var(--purple)">' + escapeHtml(shortModel) + '</span>' + subBadge + inferBadge + '</div>';
-  html += '<div class="ch-line2"><span class="' + statusClass + '">' + e.status + '</span> · 🤖 ' + (e.elapsed || '?') + 's';
+  html += '<div class="ch-line2"><span class="' + statusClass + '">' + e.status + '</span> · ' + escapeHtml(getProviderLabel(e)) + ' · dur ' + (e.elapsed || '?') + 's';
   if (stopReason) html += ' · ' + escapeHtml(stopReason);
   if (e.thinkingDuration) html += ' · <span style="color:var(--purple)">🧠 ' + e.thinkingDuration.toFixed(1) + 's</span>';
   if (turnCost != null) html += ' · <span style="color:var(--yellow)">$' + turnCost.toFixed(2) + '</span>';
   html += '</div>';
-  const cacheRead = usage.cache_read_input_tokens || 0;
-  const cacheCreate = usage.cache_creation_input_tokens || 0;
+  const cacheRead = getUsageNumber(usage, 'cache_read_input_tokens') || 0;
+  const cacheCreate = getUsageNumber(usage, 'cache_creation_input_tokens') || 0;
   html += '<div class="ch-line2" style="margin-top:2px">' + fmt(inTok) + ' in / ' + fmt(outTok) + ' out';
   if (cacheRead || cacheCreate) {
     html += ' <span style="color:var(--dim);font-size:10px">(';
@@ -1205,8 +1279,8 @@ function renderSectionsCol(idx) {
     html += '<div style="padding:4px 12px 6px;border-bottom:1px solid var(--border)"><div style="height:8px;border-radius:2px;background:var(--border);margin:4px 0 2px"></div><div style="height:12px;width:80px;border-radius:2px;background:var(--border)"></div></div>';
   }
 
-  const coreTools = req.tools ? req.tools.filter(t => !t.name.startsWith('mcp__')) : null;
-  const mcpTools  = req.tools ? req.tools.filter(t =>  t.name.startsWith('mcp__')) : null;
+  const coreTools = req.tools ? req.tools.filter(t => !isMcpTool(t)) : null;
+  const mcpTools  = req.tools ? req.tools.filter(t =>  isMcpTool(t)) : null;
   const tc = allEntries[idx]?.toolCalls || {};
   const coreCalls = Object.entries(tc).filter(([n]) => !n.startsWith('mcp__')).reduce((s, [, c]) => s + c, 0);
   const mcpCalls  = Object.entries(tc).filter(([n]) =>  n.startsWith('mcp__')).reduce((s, [, c]) => s + c, 0);
@@ -1221,7 +1295,8 @@ function renderSectionsCol(idx) {
   const sysSubline = ccVer ? 'cc ' + ccVer : '';
 
   // Compute step stats for Timeline badge
-  const previewSteps = e.reqLoaded ? getCachedSteps(req.messages, resEvents) : [];
+  const timelineMessages = e.reqLoaded ? getTimelineMessagesForEntry(e, req) : [];
+  const previewSteps = e.reqLoaded ? getCachedSteps(timelineMessages, resEvents) : [];
   const stepCount = previewSteps.length;
   const stepErrorCount = previewSteps.filter(s => s.type === 'tool-group' && s.calls.some(c => c.isError)).length;
 
@@ -1250,12 +1325,21 @@ function renderSectionsCol(idx) {
 
   // CONTEXT group (replaces REQUEST)
   html += '<div class="section-group-title">CONTEXT</div>';
-  const contextSections = [
-    { name: 'system',     label: 'System',     color: 'var(--color-system)', badge: tok.system ? fmt(tok.system) + ' tok' : (req.system ? '' : (e.reqLoaded ? '' : '…')), subline: sysSubline },
-    { name: 'core-tools', label: 'Core',        color: 'var(--color-tools)', badge: coreTools ? coreTools.length + ' tools' + (coreCalls ? ' · ' + coreCalls + '×' : '') : (e.reqLoaded ? '' : '…') },
-    { name: 'mcp-tools',  label: 'MCP',         color: 'var(--color-mcp-tools)', badge: mcpTools  ? mcpTools.length  + ' tools' + (mcpCalls  ? ' · ' + mcpCalls  + '×' : '') : (e.reqLoaded ? '' : '…') },
-  ];
-  for (const s of contextSections) { html += renderSectionItem(s); }
+  if (getEntryProvider(e) === 'openai') {
+    const inputBadge = req.input
+      ? (Array.isArray(req.input) ? req.input.length + ' items' : (typeof req.input === 'string' ? 'text' : typeof req.input))
+      : (e.reqLoaded ? '' : '…');
+    html += renderSectionItem({ name: 'system', label: 'Instructions', color: 'var(--color-system)', badge: req.instructions ? '' : (e.reqLoaded ? '' : '…') });
+    html += renderSectionItem({ name: 'codex-input', label: 'Input', color: 'var(--color-messages)', badge: inputBadge });
+    html += renderSectionItem({ name: 'codex-tools', label: 'Tools', color: 'var(--color-tools)', badge: req.tools ? req.tools.length + ' tools' : (e.reqLoaded ? '' : '…') });
+  } else {
+    const contextSections = [
+      { name: 'system',     label: 'System',     color: 'var(--color-system)', badge: tok.system ? fmt(tok.system) + ' tok' : (req.system ? '' : (e.reqLoaded ? '' : '…')), subline: sysSubline },
+      { name: 'core-tools', label: 'Core',        color: 'var(--color-tools)', badge: coreTools ? coreTools.length + ' tools' + (coreCalls ? ' · ' + coreCalls + '×' : '') : (e.reqLoaded ? '' : '…') },
+      { name: 'mcp-tools',  label: 'MCP',         color: 'var(--color-mcp-tools)', badge: mcpTools  ? mcpTools.length  + ' tools' + (mcpCalls  ? ' · ' + mcpCalls  + '×' : '') : (e.reqLoaded ? '' : '…') },
+    ];
+    for (const s of contextSections) { html += renderSectionItem(s); }
+  }
   // Skills section — shown when Skill tool is available or skills were invoked
   const sb = tok.contextBreakdown?.systemBreakdown;
   const loadedSkills = tok.contextBreakdown?.loadedSkills || [];
@@ -1288,7 +1372,7 @@ function renderSectionsCol(idx) {
   // RAW group (simplified to 2 items)
   html += '<div class="section-group-title">RAW</div>';
   html += renderSectionItem({ name: 'raw-req', label: 'Request', color: null, badge: '' });
-  html += renderSectionItem({ name: 'raw-res', label: 'Events', color: null, badge: resEvents.length ? resEvents.length + ' events' : '' });
+  html += renderSectionItem({ name: 'raw-res', label: getEntryProvider(e) === 'openai' ? 'Response' : 'Events', color: null, badge: resEvents.length ? resEvents.length + ' events' : '' });
   if (!e.reqLoaded) html += '<div style="padding:8px 12px;font-size:11px;color:var(--dim)">⏳ Loading…</div>';
   colSections.innerHTML = html;
 }
@@ -1467,6 +1551,7 @@ function renderDetailCol() {
 
   const req = e.req || {};
   const resEvents = Array.isArray(e.res) ? e.res : [];
+  const hasResponseData = e.res != null && !(Array.isArray(e.res) && e.res.length === 0);
   const loading = '<div class="col-empty">⏳ Loading…</div>';
   let inner = '';
 
@@ -1487,15 +1572,31 @@ function renderDetailCol() {
 
   switch (selectedSection) {
     case 'system':
-      if (req.system) {
+      if (getEntryProvider(e) === 'openai' && req.instructions) {
+        inner = '<div class="detail-content"><pre>' + escapeHtml(
+          typeof req.instructions === 'string' ? req.instructions : JSON.stringify(req.instructions, null, 2)
+        ) + '</pre></div>';
+      } else if (req.system) {
         inner = '<div class="detail-content">' + renderSystemBlockViewer(req.system) + '</div>';
-      } else { inner = e.reqLoaded ? '<div class="col-empty">No system prompt</div>' : loading; }
+      } else { inner = e.reqLoaded ? '<div class="col-empty">No instructions</div>' : loading; }
+      break;
+    case 'codex-input':
+      if (getEntryProvider(e) !== 'openai') { inner = '<div class="col-empty">Unknown section</div>'; break; }
+      inner = e.reqLoaded
+        ? '<div class="detail-content">' + renderCodexInput(req.input) + '</div>'
+        : loading;
+      break;
+    case 'codex-tools':
+      if (getEntryProvider(e) !== 'openai') { inner = '<div class="col-empty">Unknown section</div>'; break; }
+      inner = e.reqLoaded
+        ? '<div class="detail-content">' + renderCodexTools(req.tools) + '</div>'
+        : loading;
       break;
     case 'timeline': {
       if (!isFocusedMode) {
         // Non-focused: show step summary list with minimap (no detail pane)
         // User clicks a step or presses Enter to enter split-pane
-        prepareTimelineSteps(req.messages, resEvents);
+        prepareTimelineSteps(getTimelineMessagesForEntry(e, req), resEvents);
         if (!currentSteps.length) {
           inner = e.reqLoaded ? '<div class="col-empty">No messages</div>' : loading;
           break;
@@ -1521,7 +1622,7 @@ function renderDetailCol() {
       }
 
       // Prepare steps if needed
-      prepareTimelineSteps(req.messages, resEvents);
+      prepareTimelineSteps(getTimelineMessagesForEntry(e, req), resEvents);
       if (!currentSteps.length) {
         inner = e.reqLoaded ? '<div class="col-empty">No messages</div>' : loading;
         break;
@@ -1572,14 +1673,15 @@ function renderDetailCol() {
     case 'core-tools':
     case 'mcp-tools': {
       const isMcp = selectedSection === 'mcp-tools';
-      const filtered = req.tools ? req.tools.filter(t => isMcp ? t.name.startsWith('mcp__') : !t.name.startsWith('mcp__')) : null;
+      const filtered = req.tools ? req.tools.filter(t => isMcp ? isMcpTool(t) : !isMcpTool(t)) : null;
       if (filtered?.length) {
         const usageCount = allEntries[selectedTurnIdx]?.toolCalls || {};
-        const sorted = [...filtered].sort((a, b) => (usageCount[b.name] || 0) - (usageCount[a.name] || 0));
+        const sorted = [...filtered].sort((a, b) => (usageCount[getToolName(b)] || 0) - (usageCount[getToolName(a)] || 0));
         const tags = sorted.map(t => {
-          const cnt = usageCount[t.name] || 0;
+          const name = getToolName(t);
+          const cnt = usageCount[name] || 0;
           const badge = cnt > 0 ? ' <span style="font-size:9px;background:var(--accent);color:#fff;border-radius:3px;padding:0 3px;margin-left:3px">' + cnt + 'x</span>' : '';
-          return '<span class="tool-tag">' + escapeHtml(t.name) + badge + '</span>';
+          return '<span class="tool-tag">' + escapeHtml(name) + badge + '</span>';
         }).join('');
         inner = '<div class="detail-content"><div class="tool-grid">' + tags + '</div>' +
           '<details style="margin-top:8px"><summary style="color:var(--dim);cursor:pointer;font-size:11px">Full definitions</summary><pre>' + escapeHtml(JSON.stringify(filtered, null, 2)) + '</pre></details></div>';
@@ -1625,8 +1727,8 @@ function renderDetailCol() {
         : (e.reqLoaded ? '<div class="col-empty">No request data</div>' : loading);
       break;
     case 'raw-res':
-      inner = resEvents.length
-        ? '<div class="detail-content"><pre>' + escapeHtml(JSON.stringify(resEvents, null, 2)) + '</pre></div>'
+      inner = hasResponseData
+        ? '<div class="detail-content"><pre>' + escapeHtml(JSON.stringify(e.res, null, 2)) + '</pre></div>'
         : (e.reqLoaded ? '<div class="col-empty">No response data</div>' : loading);
       break;
     default: inner = '<div class="col-empty">Unknown section</div>';

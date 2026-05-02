@@ -221,13 +221,14 @@ function addEntry(e) {
   const tok = e.tokens || {};
   const usage = e.usage || null;
   const turnCost = e.cost?.cost != null ? e.cost.cost : (typeof e.cost === 'number' ? e.cost : null);
+  const costUnknown = e.cost && e.cost.cost == null;
 
   // Session tracking — properly deduplicated by ID
   const entryId = e.id || '';
   const entryCwd = e.cwd || null;
   if (!sessionsMap.has(sid)) {
     const shortSid = sid.slice(0, 8);
-    sessionsMap.set(sid, { id: sid, firstTs: e.ts, firstId: entryId, lastId: entryId, count: 0, mainCount: 0, subCount: 0, model, totalCost: 0, cwd: entryCwd, title: null, titleReqTs: 0, lastAssistantText: null });
+    sessionsMap.set(sid, { id: sid, firstTs: e.ts, firstId: entryId, lastId: entryId, count: 0, mainCount: 0, subCount: 0, model, totalCost: 0, hasUnknownCost: false, cwd: entryCwd, title: null, titleReqTs: 0, lastAssistantText: null });
     const sessEl = document.createElement('div');
     sessEl.className = 'session-item';
     sessEl.dataset.sessionId = sid;
@@ -252,6 +253,7 @@ function addEntry(e) {
   else sess.mainCount++;
   const displayNum = isSubagent ? ('s' + sess.subCount) : String(sess.mainCount);
   if (turnCost != null) sess.totalCost += turnCost;
+  if (costUnknown) sess.hasUnknownCost = true;
   if (!isSubagent && e.title) { const t = cleanTitle(e.title); if (t) sess.lastAssistantText = t; }
   if (!sess.toolCalls) sess.toolCalls = {};
   Object.entries(e.toolCalls || {}).forEach(([name, cnt]) => {
@@ -270,13 +272,14 @@ function addEntry(e) {
   // Project tracking
   const projName = getProjectName(sess.cwd);
   if (!projectsMap.has(projName)) {
-    projectsMap.set(projName, { name: projName, totalCost: 0, sessionIds: new Set(), firstId: entryId, lastId: entryId, lastSeenAt: Date.now() });
+    projectsMap.set(projName, { name: projName, totalCost: 0, hasUnknownCost: false, sessionIds: new Set(), firstId: entryId, lastId: entryId, lastSeenAt: Date.now() });
   }
   const proj = projectsMap.get(projName);
   proj.sessionIds.add(sid);
   proj.lastId = entryId;
   proj.lastSeenAt = Date.now();
   if (turnCost != null) proj.totalCost += turnCost;
+  if (costUnknown) proj.hasUnknownCost = true;
   renderProjectsCol();
 
   const statusClass = e.status >= 200 && e.status < 300 ? 'status-ok' : 'status-err';
@@ -328,6 +331,9 @@ function addEntry(e) {
   }
 
   allEntries.push({
+    provider: e.provider || 'anthropic',
+    agent: e.agent || (e.provider === 'openai' ? 'codex' : 'claude'),
+    responseMetadata: e.responseMetadata || null,
     tokens: tok, usage, ts: e.ts, model, maxContext: e.maxContext, cost: turnCost, sessionId: sid,
     req: e.req || null, res: e.res || null, reqLoaded: !!(e.req || e.res),
     msgCount, toolCount, toolCalls: e.toolCalls || {}, stopReason,
@@ -364,12 +370,15 @@ function addEntry(e) {
 
   // Line 1: identity + critical marker + cost
   const prefix = isSubagent ? '↳s' + sess.subCount : '#' + displayNum;
+  const providerBadge = '<span class="turn-provider">' + escapeHtml((typeof getEntryProvider === 'function' && getEntryProvider(e) === 'openai') ? 'codex' : 'claude') + '</span>';
   const modelHtml = '<span class="turn-model">' + escapeHtml(shortModel) + '</span>';
   const dotClass = e.status >= 200 && e.status < 300 ? 'status-dot status-dot-ok' : 'status-dot status-dot-err';
   const waitMark = stopReason === 'end_turn' ? '<span class="turn-wait" title="Waiting for user">↵</span>' : '';
   const critMarker = getCriticalMarker(stopReason, e.status, ctxPct);
   const critMarkerHtml = critMarker ? '<span class="turn-critical-marker">' + critMarker + '</span>' : '';
-  const costHtml = turnCost != null ? '<span class="turn-cost">$' + turnCost.toFixed(2) + '</span>' : '';
+  const costHtml = turnCost != null
+    ? '<span class="turn-cost">$' + turnCost.toFixed(2) + '</span>'
+    : (costUnknown ? '<span class="turn-cost" title="Cost unavailable for this model">cost ?</span>' : '');
   const identityTooltip = [
     isCompacted ? 'Context compacted' : null,
     e.sessionInferred ? 'Session inferred (no explicit session ID)' : null,
@@ -379,6 +388,7 @@ function addEntry(e) {
     '<div class="turn-identity"' + identityAttr + '>' +
       '<span class="' + dotClass + '" title="HTTP ' + e.status + '">●</span>' +
       '<span class="turn-num">' + prefix + '</span>' +
+      providerBadge +
       modelHtml +
       waitMark +
       critMarkerHtml +

@@ -1,5 +1,18 @@
 // ── Global Config ────────────────────────────────────────────────────
 const DEFAULT_MAX_CTX = window.__PROXY_CONFIG__?.DEFAULT_CONTEXT || 200000;
+const APP_NAME = window.__PROXY_CONFIG__?.APP_NAME || 'ccxray';
+window.CCXRAY_APP_NAME = APP_NAME;
+
+function applyAppBranding() {
+  document.title = APP_NAME;
+  const heading = document.querySelector('#topbar h1');
+  if (heading) {
+    const dot = document.createElement('span');
+    dot.className = 'dot';
+    heading.replaceChildren(dot, document.createTextNode(APP_NAME));
+  }
+}
+applyAppBranding();
 
 // ── Active Tab State ─────────────────────────────────────────────────
 let activeTab = 'dashboard';

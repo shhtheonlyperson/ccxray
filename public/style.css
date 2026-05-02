@@ -263,6 +263,7 @@
   /* Line 1: identity */
   .turn-item .turn-identity { display: flex; gap: 6px; align-items: center; font-size: 12px; flex-wrap: nowrap; }
   .turn-item .turn-num { color: var(--dim); flex-shrink: 0; }
+  .turn-provider { color: var(--dim); border: 1px solid var(--border); border-radius: 3px; padding: 0 3px; font-size: 10px; flex-shrink: 0; }
   .turn-model { color: var(--purple); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .turn-item .status-dot { font-size: 10px; line-height: 1; flex-shrink: 0; }
   .turn-item .status-dot-ok { color: var(--green); }

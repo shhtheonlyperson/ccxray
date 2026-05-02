@@ -11,8 +11,8 @@
 // ticker, observing `.si-cache[data-active="1"]` state.
 
 // Layer 1 config
-const TAB_TITLE_BASE = 'ccxray';
-const TAB_TITLE_FLASH = '⚠ ccxray';
+const TAB_TITLE_BASE = window.CCXRAY_APP_NAME || window.__PROXY_CONFIG__?.APP_NAME || 'ccxray';
+const TAB_TITLE_FLASH = '⚠ ' + TAB_TITLE_BASE;
 const LAYER1_CRITICAL_MS = 60_000;      // trigger tab flash when cache < 60s
 const FLASH_MIN_INTERVAL_MS = 900;       // min ms between title toggles
 let _flashPhase = 0;
@@ -105,7 +105,7 @@ function updateTabTitle(flash) {
 function fireNotification(sid, minsLeft) {
   const plan = window.ccxraySettings?.label || 'plan';
   try {
-    const n = new Notification('ccxray · cache expiring', {
+    const n = new Notification(TAB_TITLE_BASE + ' · cache expiring', {
       body: `Session ${formatSessionLabel(sessionsMap.get(sid), sid)} · ${plan} · ~${minsLeft} min left\nSend a prompt to refresh, or let it expire.`,
       tag: 'ccxray-cache-' + sid,
       silent: false,
