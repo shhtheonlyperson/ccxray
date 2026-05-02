@@ -675,7 +675,10 @@ function getEntryProvider(entry) {
 }
 
 function getProviderLabel(entry) {
-  return getEntryProvider(entry) === 'openai' ? 'Codex/OpenAI' : 'Claude/Anthropic';
+  const provider = getEntryProvider(entry);
+  if (provider === 'openai') return 'Codex/OpenAI';
+  if (provider === 'google') return 'Gemini/HTTPS';
+  return 'Claude/Anthropic';
 }
 
 function getToolName(tool) {
@@ -724,6 +727,13 @@ function codexInputText(item) {
 }
 
 function getTimelineMessagesForEntry(entry, req) {
+  if (getEntryProvider(entry) === 'google' && req?.method === 'CONNECT') {
+    const target = req.target || entry.url || 'unknown target';
+    return [
+      { role: 'user', content: [{ type: 'text', text: `CONNECT tunnel to ${target}` }] },
+      { role: 'assistant', content: [{ type: 'text', text: 'TLS tunnel established. Payload remains encrypted and is not captured.' }] },
+    ];
+  }
   if (Array.isArray(req.messages)) return req.messages;
   if (getEntryProvider(entry) !== 'openai') return [];
   const input = req.input;
@@ -1372,7 +1382,7 @@ function renderSectionsCol(idx) {
   // RAW group (simplified to 2 items)
   html += '<div class="section-group-title">RAW</div>';
   html += renderSectionItem({ name: 'raw-req', label: 'Request', color: null, badge: '' });
-  html += renderSectionItem({ name: 'raw-res', label: getEntryProvider(e) === 'openai' ? 'Response' : 'Events', color: null, badge: resEvents.length ? resEvents.length + ' events' : '' });
+  html += renderSectionItem({ name: 'raw-res', label: getEntryProvider(e) === 'anthropic' ? 'Events' : 'Response', color: null, badge: resEvents.length ? resEvents.length + ' events' : '' });
   if (!e.reqLoaded) html += '<div style="padding:8px 12px;font-size:11px;color:var(--dim)">⏳ Loading…</div>';
   colSections.innerHTML = html;
 }

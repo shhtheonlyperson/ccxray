@@ -370,7 +370,9 @@ function addEntry(e) {
 
   // Line 1: identity + critical marker + cost
   const prefix = isSubagent ? '↳s' + sess.subCount : '#' + displayNum;
-  const providerBadge = '<span class="turn-provider">' + escapeHtml((typeof getEntryProvider === 'function' && getEntryProvider(e) === 'openai') ? 'codex' : 'claude') + '</span>';
+  const provider = typeof getEntryProvider === 'function' ? getEntryProvider(e) : (e.provider || 'anthropic');
+  const providerLabel = provider === 'openai' ? 'codex' : provider === 'google' ? 'gemini' : 'claude';
+  const providerBadge = '<span class="turn-provider">' + escapeHtml(providerLabel) + '</span>';
   const modelHtml = '<span class="turn-model">' + escapeHtml(shortModel) + '</span>';
   const dotClass = e.status >= 200 && e.status < 300 ? 'status-dot status-dot-ok' : 'status-dot status-dot-err';
   const waitMark = stopReason === 'end_turn' ? '<span class="turn-wait" title="Waiting for user">↵</span>' : '';
