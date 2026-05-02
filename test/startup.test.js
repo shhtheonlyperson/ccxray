@@ -234,7 +234,7 @@ describe('provider launcher selection', () => {
 
     assert.equal(code, 1);
     assert.ok(stderr.includes('unsupported provider "unknown-ai"'), stderr);
-    assert.ok(stderr.includes('claude, codex'), stderr);
+    assert.ok(stderr.includes('claude, codex, gemini'), stderr);
   });
 });
 
@@ -568,6 +568,64 @@ describe('codex launcher mode', () => {
     assert.equal(code, 1);
     assert.ok(stderr.includes('"codex" command not found'), stderr);
     assert.ok(stderr.includes('@openai/codex'), stderr);
+  });
+});
+
+describe('gemini launcher mode', () => {
+  function createFakeGeminiCapture() {
+    const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), 'ccxray-fake-gemini-'));
+    const capturePath = path.join(fakeBin, 'capture.json');
+    const geminiPath = path.join(fakeBin, 'gemini');
+    fs.writeFileSync(geminiPath, [
+      '#!/bin/sh',
+      'node -e \'const fs=require("fs"); const keys=["HTTPS_PROXY","HTTP_PROXY","https_proxy","http_proxy","NO_PROXY","no_proxy","ANTHROPIC_BASE_URL"]; const env={}; for (const key of keys) env[key]=process.env[key]||null; fs.writeFileSync(process.env.CCXRAY_TEST_GEMINI_CAPTURE, JSON.stringify({ argv: process.argv.slice(1), env }));\' -- "$@"',
+    ].join('\n'));
+    fs.chmodSync(geminiPath, 0o755);
+    return { fakeBin, capturePath };
+  }
+
+  it('spawns gemini with standard proxy env and forwards user args', async () => {
+    const port = await findFreePort();
+    const { fakeBin, capturePath } = createFakeGeminiCapture();
+    try {
+      const nodeBin = path.dirname(process.execPath);
+      const { code, stderr } = await spawnAndCollect(
+        ['--port', String(port), 'gemini', '--version'],
+        8000,
+        {
+          PATH: `${fakeBin}${path.delimiter}${nodeBin}`,
+          CCXRAY_TEST_GEMINI_CAPTURE: capturePath,
+          NO_PROXY: 'corp.internal',
+        }
+      );
+
+      assert.equal(code, 0, stderr);
+      const capture = JSON.parse(fs.readFileSync(capturePath, 'utf8'));
+      assert.deepEqual(capture.argv, ['--version']);
+      assert.equal(capture.env.HTTPS_PROXY, `http://localhost:${port}`);
+      assert.equal(capture.env.HTTP_PROXY, `http://localhost:${port}`);
+      assert.equal(capture.env.https_proxy, `http://localhost:${port}`);
+      assert.equal(capture.env.http_proxy, `http://localhost:${port}`);
+      assert.equal(capture.env.NO_PROXY, 'corp.internal,localhost,127.0.0.1,::1');
+      assert.equal(capture.env.no_proxy, 'corp.internal,localhost,127.0.0.1,::1');
+      assert.equal(capture.env.ANTHROPIC_BASE_URL, null);
+    } finally {
+      fs.rmSync(fakeBin, { recursive: true, force: true });
+    }
+  });
+
+  it('reports a Gemini-specific install hint when gemini binary is missing', async () => {
+    const port = await findFreePort();
+    const nodeBin = path.dirname(process.execPath);
+    const { stderr, code } = await spawnAndCollect(
+      ['--port', String(port), 'gemini'],
+      8000,
+      { PATH: nodeBin }
+    );
+
+    assert.equal(code, 1);
+    assert.ok(stderr.includes('"gemini" command not found'), stderr);
+    assert.ok(stderr.includes('@google/gemini-cli'), stderr);
   });
 });
 

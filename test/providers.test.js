@@ -7,8 +7,8 @@ const providers = require('../server/providers');
 
 describe('agent provider registry', () => {
   it('lists the supported provider launchers', () => {
-    assert.deepEqual(providers.listAgentProviderIds(), ['claude', 'codex']);
-    assert.equal(providers.supportedProviderList(), 'claude, codex');
+    assert.deepEqual(providers.listAgentProviderIds(), ['claude', 'codex', 'gemini']);
+    assert.equal(providers.supportedProviderList(), 'claude, codex, gemini');
   });
 
   it('builds the Claude launch through the registry', () => {
@@ -48,9 +48,32 @@ describe('agent provider registry', () => {
     assert.match(launch.installHint, /openai\/codex/);
   });
 
+  it('builds the Gemini launch through standard proxy env', () => {
+    const launch = providers.getAgentLaunch('gemini', 5577, ['--version'], {
+      PATH: '/usr/bin',
+      NO_PROXY: 'corp.internal',
+    });
+
+    assert.equal(launch.provider, 'gemini');
+    assert.equal(launch.label, 'Gemini CLI');
+    assert.equal(launch.upstream, 'google');
+    assert.equal(launch.displayName, 'ccxray');
+    assert.equal(launch.bin, 'gemini');
+    assert.deepEqual(launch.args, ['--version']);
+    assert.equal(launch.env.PATH, '/usr/bin');
+    assert.equal(launch.env.HTTPS_PROXY, 'http://localhost:5577');
+    assert.equal(launch.env.HTTP_PROXY, 'http://localhost:5577');
+    assert.equal(launch.env.https_proxy, 'http://localhost:5577');
+    assert.equal(launch.env.http_proxy, 'http://localhost:5577');
+    assert.equal(launch.env.NO_PROXY, 'corp.internal,localhost,127.0.0.1,::1');
+    assert.equal(launch.env.no_proxy, 'corp.internal,localhost,127.0.0.1,::1');
+    assert.match(launch.installHint, /google\/gemini-cli/);
+  });
+
   it('centralizes display names and unsupported-provider handling', () => {
     assert.equal(providers.getDisplayName('claude', {}), 'ccxray');
     assert.equal(providers.getDisplayName('codex', {}), 'ccxray');
+    assert.equal(providers.getDisplayName('gemini', {}), 'ccxray');
     assert.equal(providers.getDisplayName('codex', { CCXRAY_DISPLAY_NAME: 'customray' }), 'customray');
     assert.equal(providers.getAgentLaunch('unknown-ai', 5577, []), null);
     assert.equal(providers.getAgentProvider('unknown-ai'), null);

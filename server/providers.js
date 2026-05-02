@@ -5,6 +5,33 @@
 // ccxray proxy, so new launchers should be additive registry entries instead
 // of new command-specific branches in server/index.js.
 
+function mergeNoProxy(currentValue, additions) {
+  const values = String(currentValue || '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean);
+  for (const value of additions) {
+    if (!values.some(existing => existing.toLowerCase() === value.toLowerCase())) {
+      values.push(value);
+    }
+  }
+  return values.join(',');
+}
+
+function withStandardProxyEnv(env, port) {
+  const proxyUrl = `http://localhost:${port}`;
+  const noProxy = mergeNoProxy(env.NO_PROXY || env.no_proxy, ['localhost', '127.0.0.1', '::1']);
+  return {
+    ...env,
+    HTTPS_PROXY: proxyUrl,
+    HTTP_PROXY: proxyUrl,
+    https_proxy: proxyUrl,
+    http_proxy: proxyUrl,
+    NO_PROXY: noProxy,
+    no_proxy: noProxy,
+  };
+}
+
 const AGENT_PROVIDERS = Object.freeze({
   claude: Object.freeze({
     id: 'claude',
@@ -32,6 +59,21 @@ const AGENT_PROVIDERS = Object.freeze({
         bin: 'codex',
         args: ['-c', `openai_base_url="http://localhost:${port}/v1"`, ...args],
         env: { ...env },
+      };
+    },
+  }),
+
+  gemini: Object.freeze({
+    id: 'gemini',
+    label: 'Gemini CLI',
+    displayName: 'ccxray',
+    upstream: 'google',
+    installHint: '  npm install -g @google/gemini-cli',
+    createLaunch({ port, args, env }) {
+      return {
+        bin: 'gemini',
+        args: [...args],
+        env: withStandardProxyEnv(env, port),
       };
     },
   }),
@@ -79,5 +121,7 @@ module.exports = {
   getDisplayName,
   isAgentProvider,
   listAgentProviderIds,
+  mergeNoProxy,
   supportedProviderList,
+  withStandardProxyEnv,
 };
