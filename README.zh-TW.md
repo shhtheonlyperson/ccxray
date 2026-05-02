@@ -25,11 +25,13 @@ ccxray 讓它變成透明的。
 npx ccxray claude
 # 或
 npx ccxray codex
+# 或
+npx ccxray gemini
 ```
 
 就這樣。代理啟動、你的 agent 透過代理連線、儀表板自動在瀏覽器中開啟。在多個終端機執行時會自動共用同一個 dashboard。
 
-launcher 參數由 provider registry 管理。目前支援 `claude` 和 `codex`；未知的 provider command 會直接失敗，避免靜默啟動未設定的 proxy。
+launcher 參數由 provider registry 管理。目前支援 `claude`、`codex` 和 `gemini`；未知的 provider command 會直接失敗，避免靜默啟動未設定的 proxy。
 
 ### 其他執行方式
 
@@ -37,6 +39,7 @@ launcher 參數由 provider registry 管理。目前支援 `claude` 和 `codex`�
 ccxray                           # 只啟動代理 + 儀表板
 ccxray claude --continue         # 所有 claude 參數直接穿透
 ccxray codex exec "hello"        # 所有 codex 參數會接在 ccxray 注入的 proxy config 之後
+ccxray gemini --version          # 所有 gemini 參數直接穿透，並使用標準 proxy env
 ccxray codex --no-browser        # 啟動 Codex 但不自動開瀏覽器；dashboard 仍在 http://localhost:5577
 ccxray --port 8080 claude        # 自訂 port（獨立模式，不共用 hub）
 ccxray claude --no-browser       # 不自動開啟瀏覽器
@@ -52,9 +55,11 @@ codex -c 'openai_base_url="http://localhost:5577/v1"' ...
 
 一般 ccxray 路徑不需要修改 `~/.codex/config.toml`。`--no-browser` 只會關閉自動開啟瀏覽器；proxy 和 dashboard 仍會在選定的 port 上運行。
 
+`ccxray gemini` 會為 spawned Gemini CLI 設定 `HTTP_PROXY`/`HTTPS_PROXY`，並支援本機 `CONNECT` tunnel。Gemini 流量在 tunnel 中仍是 TLS 加密；若要捕捉 payload，需要之後另外加入 Gemini 專用的 capture path。
+
 ### 多專案
 
-在多個終端機執行 `ccxray claude` 或 `ccxray codex` 會自動共用同一個 proxy 和 dashboard — 無需任何設定。
+在多個終端機執行 `ccxray claude`、`ccxray codex` 或 `ccxray gemini` 會自動共用同一個 proxy 和 dashboard — 無需任何設定。
 
 ```bash
 # Terminal 1

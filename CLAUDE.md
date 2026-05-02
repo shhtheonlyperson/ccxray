@@ -69,6 +69,7 @@ No build step. No linting. Restart to apply changes.
 ```
 ccxray claude (1st)  → fork detached hub → connect as client → spawn claude
 ccxray codex (2nd)   → discover hub via ~/.ccxray/hub.json → connect as client → spawn codex
+ccxray gemini (3rd)  → discover hub via ~/.ccxray/hub.json → connect as client → spawn gemini
                               ↓
                      Hub (detached process)
                        ├── HTTP proxy on :5577
@@ -88,6 +89,7 @@ ccxray codex (2nd)   → discover hub via ~/.ccxray/hub.json → connect as clie
 - Launchers are registered in `server/providers.js`. Add future providers there with one entry for command name, display name, upstream family, launch args/env, and install hint; avoid adding new `if provider` branches in `server/index.js`.
 - Claude mode sets `ANTHROPIC_BASE_URL=http://localhost:<port>` in the spawned Claude process.
 - Codex mode spawns `codex -c 'openai_base_url="http://localhost:<port>/v1"' ...args` and leaves the user's Codex auth/config otherwise intact.
+- Gemini mode spawns `gemini ...args` with `HTTP_PROXY`/`HTTPS_PROXY` pointing at ccxray. The server supports local `CONNECT` tunnels for this standard proxy mode, but Gemini payloads remain TLS-encrypted unless a Gemini-specific capture path is added later.
 - Extra user args pass through unchanged after ccxray's injected launcher config.
 - `--no-browser` only suppresses browser auto-open. The dashboard remains available on the proxy port.
 
@@ -95,6 +97,7 @@ ccxray codex (2nd)   → discover hub via ~/.ccxray/hub.json → connect as clie
 
 - `ANTHROPIC_BASE_URL` affects Claude/Anthropic upstreams only.
 - `OPENAI_BASE_URL` affects Codex/OpenAI Responses upstreams only and defaults to `https://api.openai.com/v1`.
+- `HTTP_PROXY`/`HTTPS_PROXY` affects Gemini standard proxy mode only in the spawned process. It gives ccxray a tunnel boundary, not plaintext Google API payloads.
 - Do not map Codex requests into Claude request fields. Codex uses OpenAI Responses fields such as `instructions`, `input`, and `tools`; Claude uses Anthropic Messages fields and Anthropic SSE event names.
 - Current Codex support covers HTTP `/v1/responses` and Responses `text/event-stream` SSE. Websocket transport is not guaranteed unless explicitly implemented.
 

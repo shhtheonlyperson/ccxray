@@ -25,11 +25,13 @@ ccxray makes it a glass box.
 npx ccxray claude
 # or
 npx ccxray codex
+# or
+npx ccxray gemini
 ```
 
 That's it. Proxy starts, your agent launches through it, and the dashboard opens automatically in your browser. Run it in multiple terminals — they automatically share one dashboard.
 
-The launcher argument is provider-backed. Today `claude` and `codex` are supported; unknown provider commands fail fast instead of silently starting an unconfigured proxy.
+The launcher argument is provider-backed. Today `claude`, `codex`, and `gemini` are supported; unknown provider commands fail fast instead of silently starting an unconfigured proxy.
 
 ### Other ways to run
 
@@ -37,6 +39,7 @@ The launcher argument is provider-backed. Today `claude` and `codex` are support
 ccxray                           # Proxy + dashboard only
 ccxray claude --continue         # All claude args pass through
 ccxray codex exec "hello"        # All codex args pass through after ccxray's proxy config
+ccxray gemini --version          # All gemini args pass through with standard proxy env
 ccxray codex --no-browser        # Launch Codex without auto-opening; dashboard is still at http://localhost:5577
 ccxray --port 8080 claude        # Custom port (independent, no hub sharing)
 ccxray claude --no-browser       # Skip auto-open browser
@@ -52,9 +55,11 @@ codex -c 'openai_base_url="http://localhost:5577/v1"' ...
 
 You do not need to edit `~/.codex/config.toml` for the normal ccxray path. `--no-browser` only disables auto-open; the proxy and dashboard still run on the selected port.
 
+`ccxray gemini` sets `HTTP_PROXY`/`HTTPS_PROXY` for the spawned Gemini CLI and supports local `CONNECT` tunnels. Gemini traffic remains TLS-encrypted inside the tunnel, so payload capture requires a future Gemini-specific capture path.
+
 ### Multi-project
 
-Running `ccxray claude` or `ccxray codex` in multiple terminals automatically shares a single proxy and dashboard — no configuration needed.
+Running `ccxray claude`, `ccxray codex`, or `ccxray gemini` in multiple terminals automatically shares a single proxy and dashboard — no configuration needed.
 
 ```bash
 # Terminal 1
