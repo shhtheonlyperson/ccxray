@@ -238,6 +238,102 @@ describe('provider launcher selection', () => {
   });
 });
 
+describe('standard proxy tunnel', () => {
+  let targetServer;
+  let targetPort;
+  let proxyChild;
+  let proxyPort;
+
+  before(async () => {
+    targetServer = net.createServer(socket => {
+      socket.once('data', chunk => socket.end(`echo:${chunk.toString('utf8')}`));
+    });
+    await new Promise(resolve => targetServer.listen(0, '127.0.0.1', resolve));
+    targetPort = targetServer.address().port;
+
+    proxyPort = await findFreePort();
+    proxyChild = spawnServer(['--port', String(proxyPort)]);
+    await waitForPort(proxyPort);
+  });
+
+  after(async () => {
+    if (targetServer) targetServer.close();
+    if (proxyChild) await killAndWait(proxyChild);
+  });
+
+  it('allows local CONNECT tunnels for standard HTTPS_PROXY clients', async () => {
+    const response = await new Promise((resolve, reject) => {
+      const client = net.connect(proxyPort, '127.0.0.1');
+      let buffer = Buffer.alloc(0);
+      let connected = false;
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error('CONNECT tunnel timed out'));
+      }, 3000);
+
+      client.on('connect', () => {
+        client.write(`CONNECT 127.0.0.1:${targetPort} HTTP/1.1\r\nHost: 127.0.0.1:${targetPort}\r\n\r\n`);
+      });
+      client.on('data', chunk => {
+        buffer = Buffer.concat([buffer, chunk]);
+        if (!connected) {
+          const text = buffer.toString('utf8');
+          const headerEnd = text.indexOf('\r\n\r\n');
+          if (headerEnd === -1) return;
+          if (!text.slice(0, headerEnd).includes('200 Connection Established')) {
+            clearTimeout(timer);
+            client.destroy();
+            reject(new Error(text));
+            return;
+          }
+          connected = true;
+          buffer = Buffer.alloc(0);
+          client.write('ping');
+          return;
+        }
+        const text = buffer.toString('utf8');
+        if (text.includes('echo:ping')) {
+          clearTimeout(timer);
+          client.end();
+          resolve(text);
+        }
+      });
+      client.on('error', err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    assert.ok(response.includes('echo:ping'));
+  });
+
+  it('rejects malformed CONNECT targets', async () => {
+    const response = await new Promise((resolve, reject) => {
+      const client = net.connect(proxyPort, '127.0.0.1');
+      let data = '';
+      const timer = setTimeout(() => {
+        client.destroy();
+        reject(new Error('malformed CONNECT response timed out'));
+      }, 3000);
+
+      client.on('connect', () => {
+        client.write('CONNECT not-a-target HTTP/1.1\r\nHost: not-a-target\r\n\r\n');
+      });
+      client.on('data', chunk => { data += chunk.toString('utf8'); });
+      client.on('end', () => {
+        clearTimeout(timer);
+        resolve(data);
+      });
+      client.on('error', err => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+
+    assert.ok(response.includes('400 Bad Request'), response);
+  });
+});
+
 // ── R4: EADDRINUSE handling ────────────────────────────────────────
 
 describe('R4: port conflict', () => {

@@ -2,6 +2,7 @@
 'use strict';
 
 const http = require('http');
+const net = require('net');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -165,6 +166,36 @@ function buildWebSocketForwardHeaders(clientHeaders) {
     headers[key] = value;
   }
   return headers;
+}
+
+function isLoopbackRemoteAddress(address) {
+  return new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']).has(address);
+}
+
+function isValidTcpPort(port) {
+  return Number.isInteger(port) && port >= 1 && port <= 65535;
+}
+
+function parseConnectTarget(target) {
+  const raw = String(target || '').trim();
+  const ipv6 = raw.match(/^\[([^\]]+)\]:(\d+)$/);
+  if (ipv6) {
+    const port = parseInt(ipv6[2], 10);
+    if (!isValidTcpPort(port)) return null;
+    return { host: ipv6[1], port };
+  }
+
+  const idx = raw.lastIndexOf(':');
+  if (idx <= 0) return null;
+  const host = raw.slice(0, idx);
+  const port = parseInt(raw.slice(idx + 1), 10);
+  if (!host || !isValidTcpPort(port)) return null;
+  return { host, port };
+}
+
+function closeConnectSocket(socket, status, message) {
+  if (socket.destroyed) return;
+  socket.end(`HTTP/1.1 ${status} ${message}\r\nConnection: close\r\n\r\n`);
 }
 
 function summarizeText(value, maxLen = 240) {
@@ -729,6 +760,34 @@ const server = http.createServer((clientReq, clientRes) => {
 
     forwardRequest(ctx);
   });
+});
+
+server.on('connect', (clientReq, clientSocket, head) => {
+  if (!isLoopbackRemoteAddress(clientSocket.remoteAddress)) {
+    closeConnectSocket(clientSocket, 403, 'Forbidden');
+    return;
+  }
+
+  const target = parseConnectTarget(clientReq.url);
+  if (!target) {
+    closeConnectSocket(clientSocket, 400, 'Bad Request');
+    return;
+  }
+
+  let connected = false;
+  const upstreamSocket = net.connect(target.port, target.host, () => {
+    connected = true;
+    clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+    if (head && head.length > 0) upstreamSocket.write(head);
+    upstreamSocket.pipe(clientSocket);
+    clientSocket.pipe(upstreamSocket);
+  });
+
+  upstreamSocket.on('error', () => {
+    if (!connected) closeConnectSocket(clientSocket, 502, 'Bad Gateway');
+    else clientSocket.destroy();
+  });
+  clientSocket.on('error', () => upstreamSocket.destroy());
 });
 
 server.on('upgrade', (clientReq, socket, head) => {
