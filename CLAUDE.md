@@ -4,13 +4,16 @@ Guidance for Claude Code when working with this repository.
 
 ## What is ccxray
 
-A transparent HTTP proxy that sits between Claude Code and the Anthropic API. It records every request/response, serves a real-time Miller-column dashboard at the same port, and supports request interception/editing. Zero config, zero dependencies beyond Node.js.
+A transparent HTTP proxy that sits between Claude Code and Anthropic, and Codex CLI and OpenAI Responses. It records every request/response, serves a real-time Miller-column dashboard at the same port, and supports request interception/editing. Zero config, zero dependencies beyond Node.js.
 
 ## Commands
 
 ```bash
 npx ccxray claude                                # One command: proxy + Claude Code
+npx ccxray codex                                 # One command: proxy + Codex CLI
 ccxray claude                                    # Multiple terminals auto-share one hub
+ccxray codex exec "hello"                        # Codex args pass through after proxy config
+ccxray codex --no-browser                        # Dashboard still runs; browser is not auto-opened
 ccxray --port 8080 claude                        # Custom port (opts out of hub, independent server)
 ccxray status                                    # Show hub info and connected clients
 ccxray                                           # Proxy + dashboard only
@@ -27,7 +30,7 @@ No build step. No linting. Restart to apply changes.
 | Module | Purpose |
 |--------|---------|
 | `server/index.js` | Entry point: HTTP server, request routing, startup |
-| `server/config.js` | PORT, ANTHROPIC_HOST/PORT/PROTOCOL, LOGS_DIR, MAX_ENTRIES, model context windows |
+| `server/config.js` | PORT, provider upstreams (`ANTHROPIC_BASE_URL`, `OPENAI_BASE_URL`), LOGS_DIR, MAX_ENTRIES, model context windows |
 | `server/pricing.js` | LiteLLM price fetch, 24h cache, fallback rates, cost calculation |
 | `server/cost-budget.js` | Cost data orchestration: cache, warm-up, grouping |
 | `server/cost-worker.js` | Child process: scans `~/.claude/` JSONL files without blocking event loop |
@@ -35,8 +38,8 @@ No build step. No linting. Restart to apply changes.
 | `server/sse-broadcast.js` | SSE broadcast to dashboard clients, entry summarization |
 | `server/helpers.js` | Tokenization, context breakdown, SSE parsing, formatting |
 | `server/system-prompt.js` | KNOWN_AGENTS registry, agent type detection, B2 block splitting, unified diff |
-| `server/restore.js` | Startup log restoration, lazy-load req/res from disk, delta chain reconstruction |
-| `server/forward.js` | HTTP/HTTPS proxy to Anthropic, SSE capture, response logging, proxyRes error handling |
+| `server/restore.js` | Startup log restoration, lazy-load req/res from disk, provider-specific shared prompt hydration, delta chain reconstruction |
+| `server/forward.js` | Provider-aware HTTP/HTTPS proxy, Anthropic and OpenAI Responses SSE capture, response logging, proxyRes error handling |
 | `server/routes/api.js` | REST endpoints for entries, tokens, system prompt |
 | `server/routes/sse.js` | SSE endpoint |
 | `server/routes/intercept.js` | Intercept toggle/approve/reject/timeout |
@@ -65,7 +68,7 @@ No build step. No linting. Restart to apply changes.
 
 ```
 ccxray claude (1st)  → fork detached hub → connect as client → spawn claude
-ccxray claude (2nd)  → discover hub via ~/.ccxray/hub.json → connect as client → spawn claude
+ccxray codex (2nd)   → discover hub via ~/.ccxray/hub.json → connect as client → spawn codex
                               ↓
                      Hub (detached process)
                        ├── HTTP proxy on :5577
@@ -84,15 +87,24 @@ ccxray claude (2nd)  → discover hub via ~/.ccxray/hub.json → connect as clie
 
 - Launchers are registered in `server/providers.js`. Add future providers there with one entry for command name, display name, upstream family, launch args/env, and install hint; avoid adding new `if provider` branches in `server/index.js`.
 - Claude mode sets `ANTHROPIC_BASE_URL=http://localhost:<port>` in the spawned Claude process.
+- Codex mode spawns `codex -c 'openai_base_url="http://localhost:<port>/v1"' ...args` and leaves the user's Codex auth/config otherwise intact.
 - Extra user args pass through unchanged after ccxray's injected launcher config.
 - `--no-browser` only suppresses browser auto-open. The dashboard remains available on the proxy port.
+
+### Provider Boundaries
+
+- `ANTHROPIC_BASE_URL` affects Claude/Anthropic upstreams only.
+- `OPENAI_BASE_URL` affects Codex/OpenAI Responses upstreams only and defaults to `https://api.openai.com/v1`.
+- Do not map Codex requests into Claude request fields. Codex uses OpenAI Responses fields such as `instructions`, `input`, and `tools`; Claude uses Anthropic Messages fields and Anthropic SSE event names.
+- Current Codex support covers HTTP `/v1/responses` and Responses `text/event-stream` SSE. Websocket transport is not guaranteed unless explicitly implemented.
 
 ### Data Flow
 
 ```
-Claude Code → proxy receives request → detect session (explicit or inferred)
-  → [intercept check] → log {id}_req.json → forward to Anthropic
-  → capture SSE response → log {id}_res.json → calculate cost
+Claude Code / Codex CLI → proxy receives request → choose provider upstream by route
+  → detect session (explicit or inferred) → [intercept check] → log {id}_req.json
+  → forward to Anthropic or OpenAI → capture JSON/SSE response
+  → log {id}_res.json → normalize usage/cost
   → broadcast via SSE (includes sessionInferred flag) → dashboard updates
 ```
 

@@ -2,7 +2,7 @@
 
 [English](README.md) | **正體中文** | [日本語](README.ja.md)
 
-AI 代理工作階段的透視鏡。零設定的 HTTP 代理，記錄 Claude Code 與 Anthropic API 之間的每一次呼叫，搭配即時儀表板，讓你看清代理內部到底在做什麼。
+AI 代理工作階段的透視鏡。零設定的 HTTP 代理，記錄 Claude Code 與 Anthropic API、Codex CLI 與 OpenAI Responses 之間的每一次呼叫，搭配即時儀表板，讓你看清代理內部到底在做什麼。
 
 ![License](https://img.shields.io/badge/license-MIT-blue)
 [![Mentioned in Awesome Claude Code](https://awesome.re/mentioned-badge-flat.svg)](https://github.com/hesreallyhim/awesome-claude-code)
@@ -23,33 +23,45 @@ ccxray 讓它變成透明的。
 
 ```bash
 npx ccxray claude
+# 或
+npx ccxray codex
 ```
 
-就這樣。代理啟動、Claude Code 透過代理連線、儀表板自動在瀏覽器中開啟。在多個終端機執行時會自動共用同一個 dashboard。
+就這樣。代理啟動、你的 agent 透過代理連線、儀表板自動在瀏覽器中開啟。在多個終端機執行時會自動共用同一個 dashboard。
 
-launcher 參數由 provider registry 管理。目前支援 `claude`；未知的 provider command 會直接失敗，避免靜默啟動未設定的 proxy。
+launcher 參數由 provider registry 管理。目前支援 `claude` 和 `codex`；未知的 provider command 會直接失敗，避免靜默啟動未設定的 proxy。
 
 ### 其他執行方式
 
 ```bash
 ccxray                           # 只啟動代理 + 儀表板
 ccxray claude --continue         # 所有 claude 參數直接穿透
+ccxray codex exec "hello"        # 所有 codex 參數會接在 ccxray 注入的 proxy config 之後
+ccxray codex --no-browser        # 啟動 Codex 但不自動開瀏覽器；dashboard 仍在 http://localhost:5577
 ccxray --port 8080 claude        # 自訂 port（獨立模式，不共用 hub）
 ccxray claude --no-browser       # 不自動開啟瀏覽器
 ccxray status                    # 顯示 hub 資訊及已連線的 client
 ANTHROPIC_BASE_URL=http://localhost:5577 claude   # 將現有 claude session 指向運行中的 ccxray hub
 ```
 
+`ccxray codex` 會為內建 OpenAI provider 注入 Codex config override：
+
+```bash
+codex -c 'openai_base_url="http://localhost:5577/v1"' ...
+```
+
+一般 ccxray 路徑不需要修改 `~/.codex/config.toml`。`--no-browser` 只會關閉自動開啟瀏覽器；proxy 和 dashboard 仍會在選定的 port 上運行。
+
 ### 多專案
 
-在多個終端機執行 `ccxray claude` 會自動共用同一個 proxy 和 dashboard — 無需任何設定。
+在多個終端機執行 `ccxray claude` 或 `ccxray codex` 會自動共用同一個 proxy 和 dashboard — 無需任何設定。
 
 ```bash
 # Terminal 1
 cd ~/project-a && ccxray claude     # 啟動 hub + claude
 
 # Terminal 2
-cd ~/project-b && ccxray claude     # 連線至現有 hub
+cd ~/project-b && ccxray codex      # 連線至現有 hub + 啟動 Codex
 
 # 兩個專案都顯示在 http://localhost:5577 的 dashboard
 ```
