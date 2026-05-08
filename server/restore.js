@@ -4,8 +4,19 @@ const crypto = require('crypto');
 const config = require('./config');
 const store = require('./store');
 const { calculateCost } = require('./pricing');
-const { extractAgentType, splitB2IntoBlocks } = require('./system-prompt');
+const { extractAgentType, extractPromptAgentType, splitB2IntoBlocks } = require('./system-prompt');
 const { normalizeOpenAIResponseSummary } = require('./forward');
+const { readSettings, serializeStars } = require('./settings');
+const { computeRetentionSets, isProtectedByStar } = require('./helpers');
+
+// Pull stars from settings and shape for computeRetentionSets. Returns the
+// canonical empty shape on any failure — the prune/restore paths must never
+// throw because of star bookkeeping.
+function readStarsSafe() {
+  try {
+    return serializeStars(readSettings());
+  } catch { return { projects: [], sessions: [], turns: [], steps: [] }; }
+}
 
 // ── Lazy-load req/res from disk on demand ────────────────────────────
 
@@ -94,11 +105,30 @@ async function restoreFromLogs() {
   const lines = indexContent.split('\n').filter(Boolean);
   let restored = 0;
 
+  // Pre-pass: parse minimal fields once and build star-protection sets so
+  // entries older than RESTORE_DAYS that are protected by stars are still
+  // restored. Single allocation; reused below in the main loop.
+  const stars = readStarsSafe();
+  const hasAnyStar = stars.projects.length || stars.sessions.length || stars.turns.length || stars.steps.length;
+  let retentionSets = null;
+  if (hasAnyStar && cutoffStr) {
+    const lightweight = [];
+    for (const line of lines) {
+      try {
+        const m = JSON.parse(line);
+        if (m && m.id) lightweight.push({ id: m.id, sessionId: m.sessionId, cwd: m.cwd });
+      } catch {}
+    }
+    retentionSets = computeRetentionSets(lightweight, stars);
+  }
+
   for (const line of lines) {
     let meta;
     try { meta = JSON.parse(line); } catch { continue; }
 
-    if (cutoffStr && meta.id.slice(0, 10) < cutoffStr) continue;
+    if (cutoffStr && meta.id.slice(0, 10) < cutoffStr) {
+      if (!retentionSets || !isProtectedByStar(meta, retentionSets)) continue;
+    }
 
     if (meta.provider === 'openai' && (!meta.model || !meta.stopReason || !meta.usage || !meta.isSSE)) {
       try {
@@ -168,21 +198,25 @@ async function buildVersionIndex() {
   const sysHashToAgentKey = new Map();
 
   for (const filename of sharedFiles) {
-    if (!filename.startsWith('sys_')) continue;
+    if (!filename.startsWith('sys_') && !filename.startsWith('openai_instructions_')) continue;
     try {
       const sys = JSON.parse(await config.storage.readShared(filename));
-      if (!Array.isArray(sys) || sys.length < 3) continue;
-      const b0 = sys[0]?.text || '';
-      const b2 = sys[2]?.text || '';
+      const isOpenAI = filename.startsWith('openai_instructions_');
+      if (!isOpenAI && (!Array.isArray(sys) || sys.length < 3)) continue;
+      const b0 = isOpenAI ? '' : (sys[0]?.text || '');
+      const b2 = isOpenAI ? (typeof sys === 'string' ? sys : JSON.stringify(sys, null, 2)) : (sys[2]?.text || '');
       const m = b0.match(/cc_version=(\S+?)[; ]/);
-      const ver = m ? m[1] : null;
-      const { key: agentKey, label: agentLabel } = extractAgentType(sys);
-      const sysHash = filename.replace(/^sys_/, '').replace(/\.json$/, '');
+      const { key: agentKey, label: agentLabel } = isOpenAI
+        ? extractPromptAgentType('openai', { instructions: b2 })
+        : extractAgentType(sys);
+      const sysHash = filename.replace(/^sys_/, '').replace(/^openai_instructions_/, '').replace(/\.json$/, '');
       if (sysHash && agentKey) sysHashToAgentKey.set(sysHash, agentKey);
-      if (ver && b2.length >= 500) {
-        const coreText = splitB2IntoBlocks(b2).coreInstructions || '';
+      if (b2.length >= (isOpenAI ? 1 : 500)) {
+        const coreText = isOpenAI ? b2 : (splitB2IntoBlocks(b2).coreInstructions || '');
         const coreLen = coreText.length;
         const coreHash = crypto.createHash('md5').update(coreText).digest('hex').slice(0, 12);
+        const ver = isOpenAI ? coreHash : (m ? m[1] : null);
+        if (!ver) continue;
         const idxKey = `${agentKey}::${coreHash}`;
         const existing = store.versionIndex.get(idxKey);
         if (!existing || b2.length > existing.b2Len) {
@@ -214,7 +248,34 @@ async function pruneLogs() {
   cutoff.setDate(cutoff.getDate() - config.LOG_RETENTION_DAYS);
   const cutoffStr = cutoff.toLocaleString('sv-SE', { timeZone: 'Asia/Taipei' }).slice(0, 10);
 
+  // Baseline: in-memory entries are always protected (existing behavior).
+  // After star-aware restoreFromLogs, this already includes most starred
+  // entries; the index sweep below is belt-and-suspenders for ids that fell
+  // outside the restore window or got trimmed by MAX_ENTRIES.
   const protectedIds = new Set(store.entries.map(e => e.id));
+
+  try {
+    const stars = readStarsSafe();
+    if (stars.projects.length || stars.sessions.length || stars.turns.length || stars.steps.length) {
+      const idx = await config.storage.readIndex();
+      if (idx) {
+        const indexEntries = [];
+        for (const line of idx.split('\n')) {
+          if (!line) continue;
+          try {
+            const m = JSON.parse(line);
+            if (m && m.id) indexEntries.push({ id: m.id, sessionId: m.sessionId, cwd: m.cwd });
+          } catch {}
+        }
+        const sets = computeRetentionSets(indexEntries, stars);
+        for (const e of indexEntries) {
+          if (isProtectedByStar(e, sets)) protectedIds.add(e.id);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[ccxray] star-protection pre-pass failed:', err.message);
+  }
 
   let files;
   try { files = await config.storage.list(); } catch { return; }

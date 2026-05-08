@@ -15,7 +15,7 @@ const { forwardRequest, setStatusLineEnabled, getStatusLineEnabled } = require('
 const { readSettings } = require('./settings');
 const { broadcastSessionStatus, broadcastPendingRequest } = require('./sse-broadcast');
 const { authMiddleware } = require('./auth');
-const { extractAgentType, splitB2IntoBlocks } = require('./system-prompt');
+const { extractAgentType, extractPromptAgentType, splitB2IntoBlocks } = require('./system-prompt');
 const { findSharedPrefix } = require('./delta-helpers');
 const providers = require('./providers');
 
@@ -35,6 +35,8 @@ if (portIdx !== -1) {
 }
 const hubMode = process.argv.includes('--hub-mode');
 if (hubMode) process.argv.splice(process.argv.indexOf('--hub-mode'), 1);
+const allowUpstreamLoop = process.argv.includes('--allow-upstream-loop') || process.env.CCXRAY_ALLOW_UPSTREAM_LOOP === '1';
+if (process.argv.includes('--allow-upstream-loop')) process.argv.splice(process.argv.indexOf('--allow-upstream-loop'), 1);
 const noBrowser = process.argv.includes('--no-browser');
 if (noBrowser) process.argv.splice(process.argv.indexOf('--no-browser'), 1);
 const cliCommand = process.argv[2];
@@ -87,7 +89,7 @@ function serveStatic(url, clientRes) {
   if (pathname === '/' || pathname === '/index.html') {
     const script = `<script>window.__PROXY_CONFIG__=${JSON.stringify({ DEFAULT_CONTEXT: config.DEFAULT_CONTEXT, PORT: serverPort, statusLine: getStatusLineEnabled(), APP_NAME: DISPLAY_NAME })}</script>`;
     const html = rawIndexHTML ? rawIndexHTML.replace('<!--__PROXY_CONFIG__-->', script) : '<html><body>Error loading dashboard</body></html>';
-    clientRes.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    clientRes.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
     clientRes.end(html);
     return true;
   }
@@ -99,7 +101,7 @@ function serveStatic(url, clientRes) {
   if (!filePath.startsWith(PUBLIC_DIR)) return false;
   try {
     const content = fs.readFileSync(filePath);
-    clientRes.writeHead(200, { 'Content-Type': mime + '; charset=utf-8' });
+    clientRes.writeHead(200, { 'Content-Type': mime + '; charset=utf-8', 'Cache-Control': 'no-store' });
     clientRes.end(content);
     return true;
   } catch {
@@ -137,8 +139,99 @@ function getCodexRawSessionId() {
   return 'codex-raw';
 }
 
+function firstHeader(headers, name) {
+  const value = headers?.[name.toLowerCase()];
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function getCodexSessionId(headers, parsedBody) {
+  const direct = firstHeader(headers, 'session_id') || firstHeader(headers, 'x-openai-session-id');
+  if (direct) return String(direct);
+  return parsedBody?.metadata?.session_id || null;
+}
+
+function isOpenAISubagent(headers, parsedBody) {
+  const raw = firstHeader(headers, 'x-openai-subagent');
+  if (raw != null) {
+    const text = String(raw).toLowerCase();
+    return text !== '0' && text !== 'false' && text !== 'no';
+  }
+  return Boolean(parsedBody?.metadata?.is_subagent || parsedBody?.metadata?.isSubagent);
+}
+
+function getOpenAIAgentTypeFromHeaders(headers) {
+  const subagent = firstHeader(headers, 'x-openai-subagent');
+  const direct = firstHeader(headers, 'x-openai-agent-type') || firstHeader(headers, 'x-codex-agent-type');
+  const value = direct || subagent;
+  if (!value) return null;
+  const normalized = String(value).toLowerCase();
+  if (normalized === 'explorer' || normalized === 'worker' || normalized === 'default') return normalized;
+  return null;
+}
+
+function detectOpenAISession(headers, parsedBody) {
+  if (!parsedBody) return { sessionId: getCodexRawSessionId(), isNewSession: false, inferred: true };
+  if (!getCodexSessionId(headers, parsedBody)) {
+    return { sessionId: getCodexRawSessionId(), isNewSession: false, inferred: true };
+  }
+  const detected = store.detectSession(parsedBody);
+  return {
+    sessionId: detected.sessionId || getCodexRawSessionId(),
+    isNewSession: detected.isNewSession || false,
+    inferred: detected.inferred || false,
+  };
+}
+
 function getCodexCwdFallback() {
   return hub.lookupClientCwd() || (agentCommand === 'codex' ? process.cwd() : null);
+}
+
+function getOpenAICwd(parsedBody) {
+  return parsedBody?.metadata?.cwd || getCodexCwdFallback();
+}
+
+function withCodexMetadata(parsedBody, headers) {
+  if (!parsedBody || typeof parsedBody !== 'object') return parsedBody;
+  const sessionId = getCodexSessionId(headers, parsedBody);
+  const agentType = getOpenAIAgentTypeFromHeaders(headers);
+  if (!sessionId && !agentType) return parsedBody;
+  const metadata = parsedBody.metadata && typeof parsedBody.metadata === 'object'
+    ? { ...parsedBody.metadata }
+    : {};
+  if (sessionId && !metadata.session_id) metadata.session_id = sessionId;
+  if (agentType && !metadata.agent_type) metadata.agent_type = agentType;
+  return { ...parsedBody, metadata };
+}
+
+function registerPromptVersion({ provider, parsedBody, sharedFile, promptText, firstSeen, notify = true }) {
+  if (!promptText) return null;
+  const { key: agentKey, label: agentLabel } = extractPromptAgentType(provider, parsedBody);
+  if (!agentKey || agentKey === 'unknown') return null;
+  const coreHash = crypto.createHash('md5').update(promptText).digest('hex').slice(0, 12);
+  const idxKey = `${agentKey}::${coreHash}`;
+  const version = coreHash;
+  const existing = store.versionIndex.get(idxKey);
+  if (existing) {
+    if (sharedFile) existing.sharedFile = sharedFile;
+    return { coreHash, agentKey, agentLabel, version };
+  }
+  const now = firstSeen || new Date().toISOString().slice(0, 10);
+  store.versionIndex.set(idxKey, {
+    reqId: null,
+    sharedFile,
+    b2Len: promptText.length,
+    coreLen: promptText.length,
+    coreHash,
+    firstSeen: now,
+    agentKey,
+    agentLabel,
+    version,
+  });
+  if (notify) {
+    const vData = JSON.stringify({ _type: 'version_detected', version, b2Len: promptText.length, agentKey, agentLabel });
+    for (const res of store.sseClients) res.write(`data: ${vData}\n\n`);
+  }
+  return { coreHash, agentKey, agentLabel, version };
 }
 
 // ── Server ──────────────────────────────────────────────────────────
@@ -189,14 +282,22 @@ const server = http.createServer((clientReq, clientRes) => {
 
     const upstream = config.getUpstreamForRequestAndHeaders(clientReq.url, clientReq.headers);
     const provider = upstream.provider || 'anthropic';
+    if (provider === 'openai' && parsedBody) {
+      parsedBody = withCodexMetadata(parsedBody, clientReq.headers);
+    }
 
     let reqWritePromise = null;
     let sysHash = null;
     let toolsHash = null;
+    let coreHash = null;
     if (parsedBody) {
-      sysHash = parsedBody.system
-        ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.system)).digest('hex').slice(0, 12)
-        : null;
+      sysHash = provider === 'openai'
+        ? (parsedBody.instructions != null
+          ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.instructions)).digest('hex').slice(0, 12)
+          : null)
+        : (parsedBody.system
+          ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.system)).digest('hex').slice(0, 12)
+          : null);
       toolsHash = parsedBody.tools
         ? crypto.createHash('sha256').update(JSON.stringify(parsedBody.tools)).digest('hex').slice(0, 12)
         : null;
@@ -206,6 +307,20 @@ const server = http.createServer((clientReq, clientRes) => {
           .catch(e => console.error('Write sys failed:', e.message));
         if (toolsHash) config.storage.writeSharedIfAbsent(`tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
           .catch(e => console.error('Write tools failed:', e.message));
+      } else if (provider === 'openai') {
+        if (sysHash) {
+          config.storage.writeSharedIfAbsent(`openai_instructions_${sysHash}.json`, JSON.stringify(parsedBody.instructions))
+            .catch(e => console.error('Write OpenAI instructions failed:', e.message));
+          const promptInfo = typeof parsedBody.instructions === 'string' ? registerPromptVersion({
+            provider,
+            parsedBody,
+            sharedFile: `openai_instructions_${sysHash}.json`,
+            promptText: parsedBody.instructions,
+          }) : null;
+          coreHash = promptInfo?.coreHash || null;
+        }
+        if (toolsHash) config.storage.writeSharedIfAbsent(`openai_tools_${toolsHash}.json`, JSON.stringify(parsedBody.tools))
+          .catch(e => console.error('Write OpenAI tools failed:', e.message));
       }
 
       const currMessages = Array.isArray(parsedBody.messages) ? parsedBody.messages : [];
@@ -243,15 +358,16 @@ const server = http.createServer((clientReq, clientRes) => {
         .catch(e => console.error('Write req.json failed:', e.message));
     }
 
+    const detectedSession = parsedBody
+      ? (provider === 'openai' ? detectOpenAISession(clientReq.headers, parsedBody) : store.detectSession(parsedBody))
+      : null;
     const { sessionId: reqSessionId, isNewSession, inferred: sessionInferred } = parsedBody
-      ? (provider === 'openai'
-        ? { sessionId: getCodexRawSessionId(), isNewSession: false, inferred: true }
-        : store.detectSession(parsedBody))
+      ? detectedSession
       : { sessionId: provider === 'openai' ? getCodexRawSessionId() : store.getCurrentSessionId(), isNewSession: false };
 
     // Extract and store cwd
     if (parsedBody && reqSessionId) {
-      const cwd = provider === 'openai' ? getCodexCwdFallback() : store.extractCwd(parsedBody);
+      const cwd = provider === 'openai' ? getOpenAICwd(parsedBody) : store.extractCwd(parsedBody);
       if (cwd) {
         if (!store.sessionMeta[reqSessionId]) store.sessionMeta[reqSessionId] = {};
         store.sessionMeta[reqSessionId].provider = provider;
@@ -260,8 +376,7 @@ const server = http.createServer((clientReq, clientRes) => {
     }
 
     // Detect new cc_version for live requests; compute coreHash for all qualifying requests
-    let coreHash = null;
-    if (parsedBody && Array.isArray(parsedBody.system) && parsedBody.system.length >= 3) {
+    if (parsedBody && provider === 'anthropic' && Array.isArray(parsedBody.system) && parsedBody.system.length >= 3) {
       const b0 = (parsedBody.system[0].text || '');
       const b2 = (parsedBody.system[2].text || '');
       const liveM = b0.match(/cc_version=(\S+?)[; ]/);
@@ -307,7 +422,11 @@ const server = http.createServer((clientReq, clientRes) => {
     // Build context for forwarding
     const fwdHeaders = buildForwardHeaders(clientReq.headers, upstream);
 
-    const ctx = { id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders, reqSessionId, reqWritePromise, sysHash, toolsHash, coreHash, sessionInferred, upstream };
+    const ctx = {
+      id, ts, startTime, parsedBody, rawBody, clientReq, clientRes, fwdHeaders,
+      reqSessionId, reqWritePromise, sysHash, toolsHash, coreHash, sessionInferred, upstream,
+      isSubagent: provider === 'openai' ? isOpenAISubagent(clientReq.headers, parsedBody) : undefined,
+    };
 
     // ── Intercept check ──
     const lastStop = store.sessionMeta[reqSessionId]?.lastStopReason;
@@ -480,12 +599,65 @@ async function startClientMode(lock) {
 }
 
 // ── Hub/Server startup ──
+async function runPostListenStartupTasks() {
+  store.setRestoreState({
+    phase: 'restoring',
+    restoring: true,
+    complete: false,
+    error: null,
+    startedAt: Date.now(),
+    finishedAt: null,
+  });
+
+  const pricingReady = fetchPricing().catch(err => {
+    console.error('[ccxray] Pricing warm-up failed:', err.message);
+  });
+
+  let restoreOk = false;
+  try {
+    await restoreFromLogs();
+    restoreOk = true;
+    store.setRestoreState({
+      phase: 'ready',
+      restoring: false,
+      complete: true,
+      error: null,
+      finishedAt: Date.now(),
+    });
+  } catch (err) {
+    store.setRestoreState({
+      phase: 'error',
+      restoring: false,
+      complete: true,
+      error: err.message,
+      finishedAt: Date.now(),
+    });
+    console.error('[ccxray] Restore failed:', err.message);
+  }
+
+  await pricingReady;
+  if (restoreOk) {
+    await pruneLogs();
+    warmUpCosts();
+  }
+}
+
 async function startServer() {
+  if (!allowUpstreamLoop) {
+    const localHosts = new Set(['localhost', '127.0.0.1', '::1']);
+    const upstreamFamily = providers.getAgentProvider(agentCommand)?.upstream ?? 'anthropic';
+    const upstream = config.UPSTREAMS[upstreamFamily];
+    if (upstream && localHosts.has(upstream.host) && upstream.port === config.PORT) {
+      const url = `${upstream.protocol}://${upstream.host}:${upstream.port}`;
+      const envVar = upstreamFamily === 'openai' ? 'OPENAI_BASE_URL' : 'ANTHROPIC_BASE_URL';
+      throw new Error(
+        `${envVar} points back to ccxray (${url}); unset it before starting ccxray.\n` +
+        'Pass --allow-upstream-loop or set CCXRAY_ALLOW_UPSTREAM_LOOP=1 to allow this.'
+      );
+    }
+  }
+
   await config.storage.init();
-  await fetchPricing();
-  await restoreFromLogs();
-  await pruneLogs();
-  warmUpCosts();
 
   // Agent mode (with --port, standalone): scan up to 10 ports.
   // Hub mode: fixed port, but retry if old hub is still releasing it (race with idle shutdown).
@@ -516,6 +688,8 @@ async function startServer() {
     actualPort = await hub.tryListen(server, config.PORT, maxAttempts);
   }
   rebuildIndexHTML(actualPort);
+
+  runPostListenStartupTasks();
 
   // Hub mode only: write lockfile as readiness signal, start client lifecycle
   // Do NOT write lockfile in agent mode with --port (that's independent mode)

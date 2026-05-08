@@ -4,6 +4,15 @@
 const MAX_ENTRIES = parseInt(process.env.CCXRAY_MAX_ENTRIES || '5000', 10);
 const entries = [];
 const sseClients = [];
+const restoreState = {
+  phase: 'idle',
+  restoring: false,
+  complete: false,
+  error: null,
+  startedAt: null,
+  finishedAt: null,
+  entryCount: 0,
+};
 
 function trimEntries() {
   if (entries.length > MAX_ENTRIES) {
@@ -46,6 +55,7 @@ function extractCwd(req) {
 }
 
 function extractSessionId(req) {
+  if (typeof req?.metadata?.session_id === 'string') return req.metadata.session_id;
   const uid = req?.metadata?.user_id || '';
   // New format: user_id is JSON like {"session_id":"xxx-yyy"}
   const jsonMatch = uid.match(/"session_id"\s*:\s*"([a-f0-9-]+)"/);
@@ -217,11 +227,38 @@ function getInterceptTimeout() { return interceptTimeout; }
 function setInterceptTimeout(val) { interceptTimeout = val; }
 function getCurrentSessionId() { return currentSessionId; }
 
+// Keep loadedSkills consistent across session turns: post-compaction turns lose the
+// skills system-reminder from their messages, so we cache the value in sessionMeta.
+function propagateLoadedSkills(entry, sessionId) {
+  if (!entry.tokens?.contextBreakdown || !sessionId) return;
+  const sm = sessionMeta[sessionId] || (sessionMeta[sessionId] = {});
+  const skills = entry.tokens.contextBreakdown.loadedSkills;
+  if (skills?.length) {
+    if (!sm.loadedSkills?.length) sm.loadedSkills = skills;
+  } else {
+    if (!sm.loadedSkills?.length) {
+      const peer = entries.find(
+        e => e !== entry && e.sessionId === sessionId &&
+             e.tokens?.contextBreakdown?.loadedSkills?.length > 0
+      );
+      if (peer) sm.loadedSkills = peer.tokens.contextBreakdown.loadedSkills;
+    }
+    if (sm.loadedSkills?.length) entry.tokens.contextBreakdown.loadedSkills = sm.loadedSkills;
+  }
+}
+
+function setRestoreState(patch) {
+  Object.assign(restoreState, patch);
+  restoreState.entryCount = entries.length;
+}
+
 module.exports = {
   MAX_ENTRIES,
   entries,
   trimEntries,
   sseClients,
+  restoreState,
+  setRestoreState,
   getRateLimitState,
   setRateLimitState,
   sessionMeta,
@@ -243,4 +280,5 @@ module.exports = {
   setSessionTitle,
   getSessionTitle,
   attributeTitleGen,
+  propagateLoadedSkills,
 };

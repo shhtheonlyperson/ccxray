@@ -24,6 +24,11 @@ const BLOCK_OWNERS_SERVER = {
 
 // Known agent types by b2 prefix. Order matters — first match wins.
 const KNOWN_AGENTS = [
+  { prefix: 'You are Codex',                            key: 'default',           label: 'Codex Default' },
+  { prefix: 'You are an explorer agent',                key: 'explorer',          label: 'Codex Explorer' },
+  { prefix: 'You are an agent that explores',           key: 'explorer',          label: 'Codex Explorer' },
+  { prefix: 'You are a worker agent',                   key: 'worker',            label: 'Codex Worker' },
+  { prefix: 'You are an execution agent',               key: 'worker',            label: 'Codex Worker' },
   { prefix: 'You are an interactive agent',                key: 'orchestrator',      label: 'Orchestrator' },
   { prefix: 'You are an agent for Claude Code',            key: 'general-purpose',   label: 'General Purpose' },
   { prefix: 'You are a file search specialist',            key: 'explore',           label: 'Explore' },
@@ -66,6 +71,28 @@ function extractAgentType(sys) {
   }
   logUnknownAgent(b2, 'agent');
   return { key: 'agent', label: 'Agent' };
+}
+
+function extractPromptAgentType(provider, req) {
+  if (provider === 'openai') {
+    const explicit = req?.metadata?.agent_type || req?.metadata?.agentType || req?.metadata?.agent;
+    if (explicit === 'explorer') return { key: 'explorer', label: 'Codex Explorer' };
+    if (explicit === 'worker') return { key: 'worker', label: 'Codex Worker' };
+    if (explicit === 'default') return { key: 'default', label: 'Codex Default' };
+
+    const instructions = typeof req?.instructions === 'string' ? req.instructions : JSON.stringify(req?.instructions || '');
+    if (/explorer/i.test(instructions)) return { key: 'explorer', label: 'Codex Explorer' };
+    if (/worker|execution agent/i.test(instructions)) return { key: 'worker', label: 'Codex Worker' };
+
+    const hasCodexPrompt =
+      req?.instructions != null ||
+      req?.input != null ||
+      (Array.isArray(req?.tools) && req.tools.length > 0);
+    return hasCodexPrompt
+      ? { key: 'default', label: 'Codex Default' }
+      : { key: 'unknown', label: 'Unknown' };
+  }
+  return extractAgentType(req?.system);
 }
 
 function splitB2IntoBlocks(b2) {
@@ -182,6 +209,7 @@ function computeUnifiedDiff(textA, textB, labelA, labelB) {
 module.exports = {
   BLOCK_OWNERS_SERVER,
   extractAgentType,
+  extractPromptAgentType,
   splitB2IntoBlocks,
   computeBlockDiff,
   computeUnifiedDiff,

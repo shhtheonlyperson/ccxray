@@ -156,7 +156,9 @@ describe('loadEntryReqRes — delta chain reconstruction', () => {
   });
 
   it('normalizes OpenAI SSE-shaped summaries when restoring from index', async () => {
-    const id = '2026-05-03T23-38-05-284';
+    // Use today's date so the entry is never outside the RESTORE_DAYS=3 cutoff window
+    const today = new Date().toISOString().slice(0, 10).replace(/-/g, '-');
+    const id = today + 'T23-38-05-284';
     const rawSSE = [
       'event: response.created',
       'data: ' + JSON.stringify({

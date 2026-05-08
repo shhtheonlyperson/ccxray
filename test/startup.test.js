@@ -863,6 +863,61 @@ describe('OpenAI Responses raw capture', () => {
     assert.equal(finalEvent.type, 'response.completed');
     assert.equal(finalEvent.data.response.output[0].content[0].text, 'stream ok');
   });
+
+  it('groups Codex turns by session_id header and marks OpenAI subagents', async () => {
+    const sessionId = 'codex-session-header-001';
+    const mainBody = JSON.stringify({
+      model: 'gpt-5.5',
+      instructions: 'You are Codex. Keep responses short.',
+      input: 'main turn',
+    });
+    const subagentBody = JSON.stringify({
+      model: 'gpt-5.5',
+      instructions: 'You are a worker agent for Codex. Execute the requested task.',
+      input: 'worker turn',
+    });
+
+    await sendOpenAIResponsesRequest(proxyPort, mainBody, '/v1/responses?trace=session-main', { session_id: sessionId });
+    await sendOpenAIResponsesRequest(proxyPort, subagentBody, '/v1/responses?trace=session-worker', {
+      session_id: sessionId,
+      'x-openai-subagent': 'worker',
+    });
+    await new Promise(r => setTimeout(r, 500));
+
+    const indexEntries = fs.readFileSync(path.join(TEST_HOME, 'logs', 'index.ndjson'), 'utf8')
+      .trim()
+      .split('\n')
+      .map(line => JSON.parse(line))
+      .filter(e => e.sessionId === sessionId);
+
+    assert.equal(indexEntries.length, 2);
+    assert.equal(indexEntries[0].isSubagent, false);
+    assert.equal(indexEntries[0].sessionInferred, false);
+    assert.equal(indexEntries[1].isSubagent, true);
+    assert.equal(indexEntries[1].sessionInferred, false);
+  });
+
+  it('captures Codex instructions in the System Prompt version index', async () => {
+    const sessionId = 'codex-system-prompt-001';
+    const requestBody = JSON.stringify({
+      model: 'gpt-5.5',
+      instructions: 'You are an explorer agent for Codex. Inspect the codebase and report findings.',
+      input: 'inspect prompt index',
+    });
+
+    await sendOpenAIResponsesRequest(proxyPort, requestBody, '/v1/responses?trace=sysprompt', {
+      session_id: sessionId,
+      'x-openai-subagent': 'explorer',
+    });
+    await new Promise(r => setTimeout(r, 500));
+
+    const data = await httpGet(proxyPort, '/_api/sysprompt/versions');
+    const explorer = data.versions.find(v => v.agentKey === 'explorer');
+    assert.ok(explorer, 'expected Codex explorer prompt version');
+    assert.equal(explorer.agentLabel, 'Codex Explorer');
+    assert.ok(explorer.coreHash);
+    assert.ok(explorer.b2Len > 0);
+  });
 });
 
 // ── Intercept lifecycle E2E ──────────────────────────────────────────
@@ -1555,11 +1610,11 @@ function sendProxyRequest(port, body) {
   });
 }
 
-function sendOpenAIResponsesRequest(port, body, urlPath = '/v1/responses') {
+function sendOpenAIResponsesRequest(port, body, urlPath = '/v1/responses', extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const req = http.request(`http://localhost:${port}${urlPath}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Authorization: 'Bearer test-key' },
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body), Authorization: 'Bearer test-key', ...extraHeaders },
     }, res => {
       let data = '';
       res.on('data', c => { data += c; });
@@ -1629,3 +1684,83 @@ function spawnAndCollect(args, timeoutMs = 10000, envOverrides = {}) {
     }, timeoutMs);
   });
 }
+
+describe('Proxy loop startup guard', () => {
+  it('exits when ANTHROPIC_BASE_URL points back to itself (claude mode)', async () => {
+    const proxyPort = await findFreePort();
+    const { stderr, code } = await spawnAndCollect(['--port', String(proxyPort)], 10000, {
+      ANTHROPIC_BASE_URL: `http://localhost:${proxyPort}`,
+    });
+
+    assert.equal(code, 1);
+    assert.ok(stderr.includes('ANTHROPIC_BASE_URL points back to ccxray'), `Expected loop error, got: ${stderr}`);
+    assert.ok(stderr.includes('--allow-upstream-loop'), `Expected override hint, got: ${stderr}`);
+  });
+
+  it('exits when OPENAI_BASE_URL points back to itself (codex mode)', async () => {
+    const proxyPort = await findFreePort();
+    const { stderr, code } = await spawnAndCollect(['--port', String(proxyPort), 'codex'], 10000, {
+      OPENAI_BASE_URL: `http://localhost:${proxyPort}/v1`,
+    });
+
+    assert.equal(code, 1);
+    assert.ok(stderr.includes('OPENAI_BASE_URL points back to ccxray'), `Expected loop error, got: ${stderr}`);
+    assert.ok(stderr.includes('--allow-upstream-loop'), `Expected override hint, got: ${stderr}`);
+  });
+
+  it('does NOT exit when ANTHROPIC_BASE_URL loops but running codex (different upstream)', async () => {
+    const proxyPort = await findFreePort();
+
+    // Create a stub 'codex' binary so the server can launch it without ENOENT in CI
+    // (real codex may not be installed in the test environment)
+    const stubBinDir = path.join(TEST_HOME, 'stub-bin');
+    fs.mkdirSync(stubBinDir, { recursive: true });
+    const stubCodex = path.join(stubBinDir, 'codex');
+    fs.writeFileSync(stubCodex, '#!/bin/sh\nsleep 60\n', { mode: 0o755 });
+
+    const proxyChild = spawnServer(['--port', String(proxyPort), 'codex'], {
+      env: {
+        ANTHROPIC_BASE_URL: `http://localhost:${proxyPort}`,
+        PATH: `${stubBinDir}${path.delimiter}${process.env.PATH}`,
+      },
+    });
+
+    try {
+      await waitForPort(proxyPort);
+      const health = await httpGet(proxyPort, '/_api/health');
+      assert.deepEqual(health, { ok: true });
+    } finally {
+      await killAndWait(proxyChild);
+    }
+  });
+
+  it('allows startup with --allow-upstream-loop override', async () => {
+    const proxyPort = await findFreePort();
+    const proxyChild = spawnServer(['--port', String(proxyPort), '--allow-upstream-loop'], {
+      env: { ANTHROPIC_BASE_URL: `http://localhost:${proxyPort}` },
+    });
+
+    try {
+      await waitForPort(proxyPort);
+      const health = await httpGet(proxyPort, '/_api/health');
+      assert.deepEqual(health, { ok: true });
+    } finally {
+      await killAndWait(proxyChild);
+    }
+  });
+
+  it('allows startup with CCXRAY_ALLOW_UPSTREAM_LOOP=1 override', async () => {
+    const proxyPort = await findFreePort();
+    const proxyChild = spawnServer(['--port', String(proxyPort)], {
+      env: { ANTHROPIC_BASE_URL: `http://localhost:${proxyPort}`, CCXRAY_ALLOW_UPSTREAM_LOOP: '1' },
+    });
+
+    try {
+      await waitForPort(proxyPort);
+      const health = await httpGet(proxyPort, '/_api/health');
+      assert.deepEqual(health, { ok: true });
+    } finally {
+      await killAndWait(proxyChild);
+    }
+  });
+});

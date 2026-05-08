@@ -597,6 +597,7 @@ function handleSSEResponse(ctx, proxyRes, clientRes) {
     entry._writePromise = Promise.all([ctx.reqWritePromise, resWritePromise].filter(Boolean));
     store.entries.push(entry);
     store.trimEntries();
+    store.propagateLoadedSkills(entry, sessionId);
     broadcast(entry);
 
     // Persist to index (fire-and-forget after broadcast)
@@ -714,14 +715,14 @@ function handleOpenAISSE(ctx, proxyRes, clientRes) {
       msgCount: Array.isArray(parsedBody?.input) ? parsedBody.input.length : 0,
       toolCount: Array.isArray(parsedBody?.tools) ? parsedBody.tools.length : 0,
       toolCalls: {},
-      isSubagent: false,
-      sessionInferred: true,
+      isSubagent: ctx.isSubagent || false,
+      sessionInferred: ctx.sessionInferred || false,
       title: getOpenAIInputSummary(parsedBody?.input) || getOpenAIOutputSummary(response),
       stopReason: response?.status || '',
       toolFail: false,
-      sysHash: null,
-      toolsHash: null,
-      coreHash: null,
+      sysHash: ctx.sysHash || null,
+      toolsHash: ctx.toolsHash || null,
+      coreHash: ctx.coreHash || null,
       thinkingStripped: undefined,
     };
     entry.hasCredential = helpers.entryHasCredential(entry) || undefined;
@@ -743,8 +744,8 @@ function handleOpenAISSE(ctx, proxyRes, clientRes) {
       toolFail: false,
       elapsed, status: proxyRes.statusCode,
       receivedAt: startTime,
-      sysHash: null, toolsHash: null,
-      coreHash: null,
+      sysHash: entry.sysHash, toolsHash: entry.toolsHash,
+      coreHash: entry.coreHash,
       hasCredential: entry.hasCredential,
     });
     config.storage.appendIndex(indexLine + '\n').catch(e => console.error('Write index failed:', e.message));
@@ -813,7 +814,9 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
     const resWritePromise = config.storage.write(id, '_res.json', typeof resData === 'string' ? resData : JSON.stringify(resData))
       .catch(e => console.error('Write res.json failed:', e.message));
     const maxContext = provider === 'anthropic' ? config.getMaxContext(parsedBody?.model, parsedBody?.system) : null;
-    const isSubagent = provider === 'anthropic' && !store.extractCwd(parsedBody);
+    const isSubagent = provider === 'openai'
+      ? Boolean(ctx.isSubagent)
+      : provider === 'anthropic' && !store.extractCwd(parsedBody);
     const titleGenTitle = provider === 'anthropic' ? resolveTitleGenTitle(parsedBody, resData, startTime) : null;
     const title = provider === 'openai'
       ? (getOpenAIInputSummary(parsedBody?.input) || getOpenAIOutputSummary(openAIResponse || resData))
@@ -869,6 +872,7 @@ function handleNonSSEResponse(ctx, proxyRes, clientRes) {
     entry._writePromise = Promise.all([ctx.reqWritePromise, resWritePromise].filter(Boolean));
     store.entries.push(entry);
     store.trimEntries();
+    store.propagateLoadedSkills(entry, sessionId);
     broadcast(entry);
 
     const indexLine = JSON.stringify({
