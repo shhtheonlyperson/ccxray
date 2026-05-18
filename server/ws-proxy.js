@@ -181,6 +181,13 @@ function clampWsReason(reason) {
   return out;
 }
 
+function normalizeCloseCode(code) {
+  if (!Number.isInteger(code)) return 1000;
+  if (code >= 3000 && code <= 4999) return code;
+  if (code >= 1000 && code <= 1014 && ![1004, 1005, 1006].includes(code)) return code;
+  return 1000;
+}
+
 async function recordWebSocketEntry(ctx, result) {
   const elapsed = ((Date.now() - ctx.startTime) / 1000).toFixed(1);
   const reqLog = {
@@ -373,7 +380,7 @@ function handleWebSocketUpgrade(req, socket, head) {
     }
 
     function closeBoth(code, reason) {
-      const closeCode = code || 1000;
+      const closeCode = normalizeCloseCode(code);
       const closeReason = clampWsReason(reason);
       if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
         clientWs.close(closeCode, closeReason);
@@ -435,14 +442,14 @@ function handleWebSocketUpgrade(req, socket, head) {
     clientWs.on('close', (code, reason) => {
       const reasonStr = reason.toString();
       if (upstreamWs.readyState === WebSocket.OPEN || upstreamWs.readyState === WebSocket.CONNECTING) {
-        upstreamWs.close(code, clampWsReason(reasonStr));
+        upstreamWs.close(normalizeCloseCode(code), clampWsReason(reasonStr));
       }
       finalize({ status: 101, close: { side: 'client', code, reason: reasonStr } });
     });
     upstreamWs.on('close', (code, reason) => {
       const reasonStr = reason.toString();
       if (clientWs.readyState === WebSocket.OPEN || clientWs.readyState === WebSocket.CONNECTING) {
-        clientWs.close(code, clampWsReason(reasonStr));
+        clientWs.close(normalizeCloseCode(code), clampWsReason(reasonStr));
       }
       finalize({ status: 101, close: { side: 'upstream', code, reason: reasonStr } });
     });
@@ -462,4 +469,5 @@ module.exports = {
   handleWebSocketUpgrade,
   buildWebSocketHeaders,
   isOpenAIWebSocket,
+  normalizeCloseCode,
 };

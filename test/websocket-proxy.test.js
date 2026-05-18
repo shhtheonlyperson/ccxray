@@ -257,12 +257,44 @@ describe('OpenAI Responses WebSocket proxy', () => {
     assert.equal(reqLog.endpoint, '/v1/realtime');
   });
 
+  it('records the entry and keeps running when the client disconnects abnormally', async () => {
+    upstreamWss = new WebSocket.Server({ server: upstreamServer, path: '/v1/responses' });
+    upstreamWss.on('connection', ws => {
+      ws.on('message', data => ws.send(`echo:${data.toString()}`));
+    });
+    await startProxy();
+
+    const sessionId = '019e0ab2-bcc2-7b72-a1bf-980edc2ea946';
+    const ws = new WebSocket(`ws://localhost:${proxyPort}/v1/responses`, {
+      headers: {
+        'openai-beta': 'responses_websockets=2026-02-06',
+        session_id: sessionId,
+      },
+    });
+
+    await new Promise((resolve, reject) => {
+      ws.on('open', resolve);
+      ws.on('error', reject);
+    });
+    ws.send('hello');
+    await new Promise(resolve => setTimeout(resolve, 100));
+    ws.terminate();
+
+    const entry = await waitForIndexEntry(path.join(testHome, 'logs'), e => e.sessionId === sessionId);
+    assert.equal(entry.status, 101);
+    assert.equal(entry.responseMetadata.close.side, 'client');
+    assert.equal(entry.responseMetadata.close.code, 1006);
+
+    await waitForPort(proxyPort);
+    assert.equal(proxyChild.exitCode, null);
+  });
+
   it('closes idle WebSocket pairs and records a timeout entry', async () => {
     upstreamWss = new WebSocket.Server({ server: upstreamServer, path: '/v1/responses' });
     upstreamWss.on('connection', () => {});
     await startProxy({ CCXRAY_WS_IDLE_TIMEOUT_MS: '100' });
 
-    const sessionId = '019e0ab2-bcc2-7b72-a1bf-980edc2ea946';
+    const sessionId = '019e0ab2-bcc2-7b72-a1bf-980edc2ea947';
     const ws = new WebSocket(`ws://localhost:${proxyPort}/v1/responses`, {
       headers: {
         'openai-beta': 'responses_websockets=2026-02-06',
